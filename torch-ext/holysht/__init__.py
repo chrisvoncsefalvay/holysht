@@ -2,35 +2,41 @@
 
 CUDA-accelerated spherical harmonic transforms designed as a practical,
 production-oriented companion to torch-harmonics.
+
+Author: Chris von Csefalvay
+Licence: MIT
+Repository: https://github.com/chrisvoncsefalvay/holysht
+Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
 """
 
+import contextlib
+import os
 from typing import Optional
 import torch
 import torch.nn as nn
 
 __all__ = [
-    "legendre_forward",
-    "legendre_inverse",
-    "sht_forward",
-    "sht_inverse",
     "RealSHT",
     "InverseRealSHT",
     "RealVectorSHT",
     "InverseRealVectorSHT",
-    "fused_legendre_forward",
-    "fused_legendre_inverse",
-    "fused_sht_forward",
-    "fused_sht_inverse",
-    "FusedRealSHT",
-    "FusedInverseRealSHT",
-    "FusedRealVectorSHT",
-    "FusedInverseRealVectorSHT",
+    "legendre_forward",
+    "legendre_inverse",
+    "sht_forward",
+    "sht_inverse",
 ]
 
-# Try to load compiled CUDA extension
+# Prefer kernel-builder's generated alias module on packaged builds, then fall
+# back to the local single-machine JIT loader for development.
 try:
     from ._ops import ops as _ops
     _HAS_CUDA_EXT = True
+except ModuleNotFoundError:
+    try:
+        from ._jit_ops import ops as _ops
+        _HAS_CUDA_EXT = True
+    except ImportError:
+        _HAS_CUDA_EXT = False
 except ImportError:
     _HAS_CUDA_EXT = False
 
@@ -47,9 +53,52 @@ def _can_use_cuda_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]
     )
 
 
+def _can_use_cuda_real_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]) -> bool:
+    return (
+        _HAS_CUDA_EXT
+        and weight_t is not None
+        and input.is_cuda
+        and weight_t.is_cuda
+        and input.dtype in (torch.float32, torch.bfloat16)
+        and weight_t.dtype == torch.float32
+        and input.is_contiguous()
+        and weight_t.is_contiguous()
+    )
+
+
+def _can_use_cuda_vector(input: torch.Tensor, weight0_t: Optional[torch.Tensor], weight1_t: Optional[torch.Tensor]) -> bool:
+    return (
+        _HAS_CUDA_EXT
+        and weight0_t is not None
+        and weight1_t is not None
+        and input.is_cuda
+        and weight0_t.is_cuda
+        and weight1_t.is_cuda
+        and input.dtype == torch.complex64
+        and weight0_t.dtype == torch.float32
+        and weight1_t.dtype == torch.float32
+        and input.is_contiguous()
+        and weight0_t.is_contiguous()
+        and weight1_t.is_contiguous()
+    )
+
+
 def _mul_i(x: torch.Tensor) -> torch.Tensor:
     """Multiply a complex tensor by +i without promoting dtype."""
     return torch.complex(-x.imag, x.real)
+
+
+@contextlib.contextmanager
+def _nvtx_range(name: str):
+    enabled = os.environ.get("HOLYSHT_ENABLE_NVTX", "0") == "1"
+    if enabled and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
 
 
 def _prepare_irfft_input(x: torch.Tensor, nlon: int, active_mmax: Optional[int] = None) -> torch.Tensor:
@@ -72,8 +121,10 @@ def _prepare_irfft_input(x: torch.Tensor, nlon: int, active_mmax: Optional[int] 
         return flat.reshape(orig_shape)
 
     out[..., 0] = out[..., 0].real.to(torch.complex64)
-    if nlon % 2 == 0 and nlon // 2 < out.size(-1):
-        out[..., nlon // 2] = out[..., nlon // 2].real.to(torch.complex64)
+    if nlon % 2 == 0:
+        nyquist_idx = nlon // 2
+        if nyquist_idx < out.size(-1):
+            out[..., nyquist_idx] = out[..., nyquist_idx].real.to(torch.complex64)
     return out
 
 
@@ -125,6 +176,78 @@ class _FusedLegendreInverseFn(torch.autograd.Function):
         return grad_input, None
 
 
+class _FusedLegendreForwardRealFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
+        input_c = input.contiguous()
+        output = torch.empty(
+            input_c.size(0), weight_t.size(0), input_c.size(2),
+            device=input_c.device, dtype=torch.float32
+        )
+        _ops.fused_legendre_forward_real(output, input_c, weight_t)
+        ctx.save_for_backward(weight_t)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (weight_t,) = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty(
+            grad_output.size(0), weight_t.size(1), grad_output.size(2),
+            device=grad_output.device, dtype=torch.float32
+        )
+        _ops.fused_legendre_inverse_real(grad_input, grad_output, weight_t)
+        return grad_input, None
+
+
+class _FusedVectorLegendreForwardFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, weight0_t: torch.Tensor, weight1_t: torch.Tensor) -> torch.Tensor:
+        input_c = input.contiguous()
+        output = torch.empty(
+            input_c.size(0), 2, weight0_t.size(0), input_c.size(3),
+            device=input_c.device, dtype=torch.complex64
+        )
+        _ops.fused_vector_legendre_forward(output, input_c, weight0_t, weight1_t)
+        ctx.save_for_backward(weight0_t, weight1_t)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        weight0_t, weight1_t = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty(
+            grad_output.size(0), 2, weight0_t.size(1), grad_output.size(3),
+            device=grad_output.device, dtype=torch.complex64
+        )
+        _ops.fused_vector_legendre_inverse(grad_input, grad_output, weight0_t, weight1_t)
+        return grad_input, None, None
+
+
+class _FusedVectorLegendreInverseFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, weight0_t: torch.Tensor, weight1_t: torch.Tensor) -> torch.Tensor:
+        input_c = input.contiguous()
+        output = torch.empty(
+            input_c.size(0), 2, weight0_t.size(1), input_c.size(3),
+            device=input_c.device, dtype=torch.complex64
+        )
+        _ops.fused_vector_legendre_inverse(output, input_c, weight0_t, weight1_t)
+        ctx.save_for_backward(weight0_t, weight1_t)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        weight0_t, weight1_t = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty(
+            grad_output.size(0), 2, weight0_t.size(0), grad_output.size(3),
+            device=grad_output.device, dtype=torch.complex64
+        )
+        _ops.fused_vector_legendre_forward(grad_input, grad_output, weight0_t, weight1_t)
+        return grad_input, None, None
+
+
 # ============================================================================
 # Fused Legendre Transform
 # ============================================================================
@@ -139,8 +262,8 @@ def fused_legendre_forward(
     Computes out[b,l,m] = Σ_k weights[m,l,k] · input[b,k,m] for complex input,
     fusing the real and imaginary multiplications into a single pass.
 
-    For small grids (nlat ≤ 128), uses a custom CUDA kernel.
-    For larger grids, uses a single batched einsum (stacking re/im).
+    Uses the custom CUDA kernels when the extension is available, otherwise
+    falls back to a stacked einsum.
     """
     B = input.size(0)
     nlat = input.size(1)
@@ -188,6 +311,17 @@ def fused_legendre_inverse(
         return torch.complex(out_stacked[:B], out_stacked[B:])
 
 
+def fused_legendre_forward_real(
+    input: torch.Tensor,       # [B, nlat, mmax] float32 or bfloat16
+    weight_t: torch.Tensor,    # [lmax, nlat, mmax] float32
+) -> torch.Tensor:
+    """Real-valued forward Legendre transform with float accumulation."""
+    if _can_use_cuda_real_legendre(input, weight_t):
+        return _FusedLegendreForwardRealFn.apply(input, weight_t)
+
+    return torch.einsum("bkm,lkm->blm", input.float(), weight_t)
+
+
 # ============================================================================
 # Fused SHT (complete pipeline)
 # ============================================================================
@@ -202,14 +336,10 @@ def fused_sht_forward(
 
     Replaces RealSHT.forward() with fewer intermediate allocations.
     """
-    # Step 1: Real FFT along longitude
-    x_fft = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
-
-    # Step 2: Slice to mmax wavenumbers
-    x_fft = x_fft[..., :mmax]
-
-    # Step 3: Fused Legendre transform (handles complex natively)
-    return fused_legendre_forward(x_fft, weights, weight_t)
+    with _nvtx_range("holysht.scalar_forward"):
+        x_fft = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
+        x_fft = x_fft[..., :mmax]
+        return fused_legendre_forward(x_fft, weights, weight_t)
 
 
 def fused_sht_inverse(
@@ -219,14 +349,10 @@ def fused_sht_inverse(
     pct_t: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Complete fused inverse SHT: fused Legendre → zero-pad → irfft."""
-    # Step 1: Fused inverse Legendre
-    x = fused_legendre_inverse(coeffs, pct, pct_t)
-
-    # Step 2: Zero-pad plus clean DC/Nyquist using the CUDA helper when available
-    x = _prepare_irfft_input(x, nlon, coeffs.size(-1))
-
-    # Step 3: Inverse real FFT
-    return torch.fft.irfft(x, n=nlon, dim=-1, norm="forward")
+    with _nvtx_range("holysht.scalar_inverse"):
+        x = fused_legendre_inverse(coeffs, pct, pct_t)
+        x = _prepare_irfft_input(x, nlon, coeffs.size(-1))
+        return torch.fft.irfft(x, n=nlon, dim=-1, norm="forward")
 
 
 # ============================================================================
@@ -234,7 +360,7 @@ def fused_sht_inverse(
 # ============================================================================
 
 class RealSHT(nn.Module):
-    """Optimized drop-in replacement for ``torch_harmonics.RealSHT``.
+    """Optimised drop-in replacement for ``torch_harmonics.RealSHT``.
 
     Args:
         dtype: Weight precision. ``"fp32"`` (default) or ``"bf16"``.
@@ -276,18 +402,25 @@ class RealSHT(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._use_bf16:
-            x_fft = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
-            x_fft = x_fft[..., :self.mmax]
-            xr = torch.view_as_real(x_fft)
-            B = x.size(0)
-            xs = torch.cat([xr[..., 0], xr[..., 1]], dim=0).bfloat16()
-            out = torch.einsum("bkm,mlk->blm", xs, self.weights).float()
-            return torch.complex(out[:B], out[B:])
+            with _nvtx_range("holysht.scalar_forward_bf16"):
+                x_fft = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
+                x_fft = x_fft[..., :self.mmax]
+                xr = torch.view_as_real(x_fft)
+                if _HAS_CUDA_EXT and x.is_cuda and not x.requires_grad:
+                    xr_bf16 = xr.bfloat16().contiguous()
+                    out_re = fused_legendre_forward_real(xr_bf16[..., 0].contiguous(), self.weight_t)
+                    out_im = fused_legendre_forward_real(xr_bf16[..., 1].contiguous(), self.weight_t)
+                    return torch.complex(out_re, out_im)
+
+                B = x.size(0)
+                xs = torch.cat([xr[..., 0], xr[..., 1]], dim=0).bfloat16()
+                out = torch.einsum("bkm,mlk->blm", xs, self.weights).float()
+                return torch.complex(out[:B], out[B:])
         return fused_sht_forward(x, self.weights, self.mmax, self.weight_t)
 
 
 class InverseRealSHT(nn.Module):
-    """Optimized drop-in replacement for ``torch_harmonics.InverseRealSHT``."""
+    """Optimised drop-in replacement for ``torch_harmonics.InverseRealSHT``."""
 
     def __init__(
         self,
@@ -325,7 +458,7 @@ class InverseRealSHT(nn.Module):
 
 
 class RealVectorSHT(nn.Module):
-    """Optimized drop-in replacement for ``torch_harmonics.RealVectorSHT``.
+    """Optimised drop-in replacement for ``torch_harmonics.RealVectorSHT``.
 
     Reduces eight reference einsums to two composed Legendre passes on the
     default FP32 CUDA path.
@@ -373,90 +506,72 @@ class RealVectorSHT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-2] == self.nlat and x.shape[-1] == self.nlon
 
-        # rfft along longitude
-        x = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
-        if (not self._use_bf16) and _HAS_CUDA_EXT and x.is_cuda:
+        with _nvtx_range("holysht.vector_forward"):
+            x = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
             mmax = self.mmax
-            comp0 = x[..., 0, :, :mmax]
-            comp1 = x[..., 1, :, :mmax]
-            B_shape = comp0.shape[:-2]
-            comp0_flat = comp0.reshape(-1, self.nlat, mmax).contiguous()
-            comp1_flat = comp1.reshape(-1, self.nlat, mmax).contiguous()
-            B = comp0_flat.shape[0]
+            x = x[..., :mmax].contiguous()
 
-            packed = torch.cat([comp0_flat, comp1_flat], dim=0)
-            out_w0 = fused_legendre_forward(packed, self.w0.float(), self.w0_t)
-            out_w1 = fused_legendre_forward(packed, self.w1.float(), self.w1_t)
+            if (not self._use_bf16) and _can_use_cuda_vector(x, self.w0_t, self.w1_t):
+                B_shape = x.shape[:-3]
+                x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
+                out = _FusedVectorLegendreForwardFn.apply(x_flat, self.w0_t, self.w1_t)
+                return out.reshape(B_shape + (2, self.lmax, mmax))
 
-            y0, y1 = out_w0[:B], out_w0[B:]
-            z0, z1 = out_w1[:B], out_w1[B:]
+            x = torch.view_as_real(x)  # [..., 2, nlat, mmax, 2]
 
-            sph = y0 + _mul_i(z1)
-            tor = _mul_i(z0) - y1
+            x00 = x[..., 0, :, :, 0]
+            x01 = x[..., 0, :, :, 1]
+            x10 = x[..., 1, :, :, 0]
+            x11 = x[..., 1, :, :, 1]
 
-            sph = sph.reshape(B_shape + (self.lmax, mmax))
-            tor = tor.reshape(B_shape + (self.lmax, mmax))
-            return torch.stack((sph, tor), dim=-3)
+            B_shape = x00.shape[:-2]
+            x00_flat = x00.reshape(-1, self.nlat, mmax)
+            x01_flat = x01.reshape(-1, self.nlat, mmax)
+            x10_flat = x10.reshape(-1, self.nlat, mmax)
+            x11_flat = x11.reshape(-1, self.nlat, mmax)
+            B = x00_flat.shape[0]
 
-        x = torch.view_as_real(x)  # [..., 2, nlat, nlon//2+1, 2]
+            if self._use_bf16 and _HAS_CUDA_EXT and x00_flat.is_cuda and not x.requires_grad:
+                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).bfloat16().contiguous()
+                out_w0 = fused_legendre_forward_real(stacked_w0, self.w0_t)
+                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
 
-        mmax = self.mmax
+                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).bfloat16().contiguous()
+                out_w1 = fused_legendre_forward_real(stacked_w1, self.w1_t)
+                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
+            else:
+                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0)
+                if self._use_bf16:
+                    stacked_w0 = stacked_w0.bfloat16()
+                out_w0 = torch.einsum("bkm,mlk->blm", stacked_w0, self.w0)
+                if self._use_bf16:
+                    out_w0 = out_w0.float()
+                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
 
-        # Extract the 4 input slices: x[..., comp, :, :mmax, re/im]
-        x00 = x[..., 0, :, :mmax, 0]  # comp0, real
-        x01 = x[..., 0, :, :mmax, 1]  # comp0, imag
-        x10 = x[..., 1, :, :mmax, 0]  # comp1, real
-        x11 = x[..., 1, :, :mmax, 1]  # comp1, imag
+                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0)
+                if self._use_bf16:
+                    stacked_w1 = stacked_w1.bfloat16()
+                out_w1 = torch.einsum("bkm,mlk->blm", stacked_w1, self.w1)
+                if self._use_bf16:
+                    out_w1 = out_w1.float()
+                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
 
-        # Stack all 4 inputs for W0: [4*B, nlat, mmax]
-        B_shape = x00.shape[:-2]  # batch dimensions
-        x00_flat = x00.reshape(-1, self.nlat, mmax)
-        x01_flat = x01.reshape(-1, self.nlat, mmax)
-        x10_flat = x10.reshape(-1, self.nlat, mmax)
-        x11_flat = x11.reshape(-1, self.nlat, mmax)
-        B = x00_flat.shape[0]
+            sph_re = r00 - s11
+            sph_im = r01 + s10
+            tor_re = -s01 - r10
+            tor_im = s00 - r11
 
-        # W0 einsums: x00, x01, x10, x11 (used in spheroidal_re, spheroidal_im, toroidal_re, toroidal_im)
-        stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0)
-        if self._use_bf16:
-            stacked_w0 = stacked_w0.bfloat16()
-        out_w0 = torch.einsum("bkm,mlk->blm", stacked_w0, self.w0)
-        if self._use_bf16:
-            out_w0 = out_w0.float()
-        r00, r01, r10, r11 = out_w0[:B], out_w0[B:2*B], out_w0[2*B:3*B], out_w0[3*B:]
-
-        # W1 einsums: x11, x10, x01, x00 (used in spheroidal_re, spheroidal_im, toroidal_re, toroidal_im)
-        stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0)
-        if self._use_bf16:
-            stacked_w1 = stacked_w1.bfloat16()
-        out_w1 = torch.einsum("bkm,mlk->blm", stacked_w1, self.w1)
-        if self._use_bf16:
-            out_w1 = out_w1.float()
-        s11, s10, s01, s00 = out_w1[:B], out_w1[B:2*B], out_w1[2*B:3*B], out_w1[3*B:]
-
-        # Combine with correct signs:
-        # spheroidal_re = +einsum(x00, W0) - einsum(x11, W1)
-        # spheroidal_im = +einsum(x01, W0) + einsum(x10, W1)
-        # toroidal_re   = -einsum(x01, W1) - einsum(x10, W0)
-        # toroidal_im   = +einsum(x00, W1) - einsum(x11, W0)
-        sph_re = r00 - s11
-        sph_im = r01 + s10
-        tor_re = -s01 - r10
-        tor_im = s00 - r11
-
-        # Reconstruct output: [..., 2, lmax, mmax] complex
-        out_shape = list(B_shape) + [2, self.lmax, mmax, 2]
-        xout = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
-        xout[..., 0, :, :, 0] = sph_re.reshape(B_shape + (self.lmax, mmax))
-        xout[..., 0, :, :, 1] = sph_im.reshape(B_shape + (self.lmax, mmax))
-        xout[..., 1, :, :, 0] = tor_re.reshape(B_shape + (self.lmax, mmax))
-        xout[..., 1, :, :, 1] = tor_im.reshape(B_shape + (self.lmax, mmax))
-
-        return torch.view_as_complex(xout)
+            out_shape = list(B_shape) + [2, self.lmax, mmax, 2]
+            xout = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
+            xout[..., 0, :, :, 0] = sph_re.reshape(B_shape + (self.lmax, mmax))
+            xout[..., 0, :, :, 1] = sph_im.reshape(B_shape + (self.lmax, mmax))
+            xout[..., 1, :, :, 0] = tor_re.reshape(B_shape + (self.lmax, mmax))
+            xout[..., 1, :, :, 1] = tor_im.reshape(B_shape + (self.lmax, mmax))
+            return torch.view_as_complex(xout)
 
 
 class InverseRealVectorSHT(nn.Module):
-    """Optimized drop-in replacement for ``torch_harmonics.InverseRealVectorSHT``."""
+    """Optimised drop-in replacement for ``torch_harmonics.InverseRealVectorSHT``."""
 
     def __init__(
         self,
@@ -494,82 +609,56 @@ class InverseRealVectorSHT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-2] == self.lmax and x.shape[-1] == self.mmax
 
-        if _HAS_CUDA_EXT and x.is_cuda:
-            sph = x[..., 0, :, :]
-            tor = x[..., 1, :, :]
-            B_shape = sph.shape[:-2]
-            sph_flat = sph.reshape(-1, self.lmax, self.mmax).contiguous()
-            tor_flat = tor.reshape(-1, self.lmax, self.mmax).contiguous()
-            B = sph_flat.shape[0]
+        with _nvtx_range("holysht.vector_inverse"):
+            x = x.contiguous()
+            if _can_use_cuda_vector(x, self.d0_t, self.d1_t):
+                B_shape = x.shape[:-3]
+                x_flat = x.reshape(-1, 2, self.lmax, self.mmax).contiguous()
+                x_out = _FusedVectorLegendreInverseFn.apply(x_flat, self.d0_t, self.d1_t)
+                x_out = x_out.reshape(B_shape + (2, self.nlat, self.mmax))
+                x_out = _prepare_irfft_input(x_out, self.nlon, self.mmax)
+                return torch.fft.irfft(x_out, n=self.nlon, dim=-1, norm="forward")
 
-            packed = torch.cat([sph_flat, tor_flat], dim=0)
-            out_d0 = fused_legendre_inverse(packed, self.d0, self.d0_t)
-            out_d1 = fused_legendre_inverse(packed, self.d1, self.d1_t)
+            x = torch.view_as_real(x)  # [..., 2, lmax, mmax, 2]
+            mmax = self.mmax
 
-            y0, y1 = out_d0[:B], out_d0[B:]
-            z0, z1 = out_d1[:B], out_d1[B:]
+            x00 = x[..., 0, :, :, 0]
+            x01 = x[..., 0, :, :, 1]
+            x10 = x[..., 1, :, :, 0]
+            x11 = x[..., 1, :, :, 1]
 
-            comp0 = y0 + _mul_i(z1)
-            comp1 = _mul_i(z0) - y1
+            B_shape = x00.shape[:-2]
+            x00_flat = x00.reshape(-1, self.lmax, mmax)
+            x01_flat = x01.reshape(-1, self.lmax, mmax)
+            x10_flat = x10.reshape(-1, self.lmax, mmax)
+            x11_flat = x11.reshape(-1, self.lmax, mmax)
+            B = x00_flat.shape[0]
 
-            comp0 = comp0.reshape(B_shape + (self.nlat, self.mmax))
-            comp1 = comp1.reshape(B_shape + (self.nlat, self.mmax))
-            x_out = torch.stack((comp0, comp1), dim=-3)
+            stacked_d0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0)
+            out_d0 = torch.einsum("blm,mlk->bkm", stacked_d0, self.d0)
+            r00, r01, r10, r11 = out_d0[:B], out_d0[B:2 * B], out_d0[2 * B:3 * B], out_d0[3 * B:]
+
+            stacked_d1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0)
+            out_d1 = torch.einsum("blm,mlk->bkm", stacked_d1, self.d1)
+            s11, s10, s01, s00 = out_d1[:B], out_d1[B:2 * B], out_d1[2 * B:3 * B], out_d1[3 * B:]
+
+            srl = r00 - s11
+            sim = r01 + s10
+            trl = -s01 - r10
+            tim = s00 - r11
+
+            out_k = self.nlat
+            srl = srl.reshape(B_shape + (out_k, mmax))
+            sim = sim.reshape(B_shape + (out_k, mmax))
+            trl = trl.reshape(B_shape + (out_k, mmax))
+            tim = tim.reshape(B_shape + (out_k, mmax))
+
+            s = torch.stack((srl, sim), -1)
+            t = torch.stack((trl, tim), -1)
+            xs = torch.stack((s, t), -4)
+            x_out = torch.view_as_complex(xs)
             x_out = _prepare_irfft_input(x_out, self.nlon, self.mmax)
             return torch.fft.irfft(x_out, n=self.nlon, dim=-1, norm="forward")
-
-        x = torch.view_as_real(x)  # [..., 2, lmax, mmax, 2]
-
-        mmax = self.mmax
-
-        # Extract 4 input slices
-        x00 = x[..., 0, :, :, 0]  # comp0, real
-        x01 = x[..., 0, :, :, 1]  # comp0, imag
-        x10 = x[..., 1, :, :, 0]  # comp1, real
-        x11 = x[..., 1, :, :, 1]  # comp1, imag
-
-        B_shape = x00.shape[:-2]
-        x00_flat = x00.reshape(-1, self.lmax, mmax)
-        x01_flat = x01.reshape(-1, self.lmax, mmax)
-        x10_flat = x10.reshape(-1, self.lmax, mmax)
-        x11_flat = x11.reshape(-1, self.lmax, mmax)
-        B = x00_flat.shape[0]
-
-        # d0 einsums: x00, x01, x10, x11
-        stacked_d0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0)
-        out_d0 = torch.einsum("blm,mlk->bkm", stacked_d0, self.d0)
-        r00, r01, r10, r11 = out_d0[:B], out_d0[B:2*B], out_d0[2*B:3*B], out_d0[3*B:]
-
-        # d1 einsums: x11, x10, x01, x00
-        stacked_d1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0)
-        out_d1 = torch.einsum("blm,mlk->bkm", stacked_d1, self.d1)
-        s11, s10, s01, s00 = out_d1[:B], out_d1[B:2*B], out_d1[2*B:3*B], out_d1[3*B:]
-
-        # Combine with correct signs (same as forward):
-        # srl = +einsum(x00, d0) - einsum(x11, d1)
-        # sim = +einsum(x01, d0) + einsum(x10, d1)
-        # trl = -einsum(x01, d1) - einsum(x10, d0)
-        # tim = +einsum(x00, d1) - einsum(x11, d0)
-        srl = r00 - s11
-        sim = r01 + s10
-        trl = -s01 - r10
-        tim = s00 - r11
-
-        # Reassemble
-        out_k = self.nlat
-        srl = srl.reshape(B_shape + (out_k, mmax))
-        sim = sim.reshape(B_shape + (out_k, mmax))
-        trl = trl.reshape(B_shape + (out_k, mmax))
-        tim = tim.reshape(B_shape + (out_k, mmax))
-
-        s = torch.stack((srl, sim), -1)
-        t = torch.stack((trl, tim), -1)
-        xs = torch.stack((s, t), -4)
-        x_out = torch.view_as_complex(xs)
-
-        x_out = _prepare_irfft_input(x_out, self.nlon, self.mmax)
-
-        return torch.fft.irfft(x_out, n=self.nlon, dim=-1, norm="forward")
 
 
 legendre_forward = fused_legendre_forward

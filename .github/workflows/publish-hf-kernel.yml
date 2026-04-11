@@ -1,0 +1,82 @@
+# HOLYSHT
+# Author: Chris von Csefalvay
+# Licence: MIT
+# Repository: https://github.com/chrisvoncsefalvay/holysht
+# Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
+
+name: publish hf kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_id:
+        description: Hugging Face repo id
+        required: false
+        default: chrisvoncsefalvay/holysht
+      private:
+        description: Create the repo as private if it does not exist
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-hf-kernel
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "1"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MAX_JOBS: "1"
+      NINJAFLAGS: "-j1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Enable the GitHub Actions Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Enable the Hugging Face binary cache
+        run: nix run nixpkgs#cachix -- use huggingface
+
+      - name: Build the kernel variants with kernel-builder
+        run: nix run -L --max-jobs 1 --cores 4 .#build-and-copy
+
+      - name: Publish the staged kernel repository to the Hugging Face Hub
+        env:
+          HF_REPO_ID: ${{ github.event.inputs.repo_id }}
+          HF_REPO_PRIVATE: ${{ github.event.inputs.private }}
+        run: |
+          test -n "${HF_TOKEN}" || {
+            echo "::error::HF_TOKEN is not set. Add it as a repository secret."
+            exit 1
+          }
+          repo_id="${HF_REPO_ID:-chrisvoncsefalvay/holysht}"
+          repo_private="${HF_REPO_PRIVATE:-false}"
+          python -m pip install --upgrade pip
+          python -m pip install huggingface_hub
+          args=(--repo-id "${repo_id}")
+          if [[ "${repo_private}" == "true" ]]; then
+            args+=(--private)
+          fi
+          python scripts/publish_hf_kernel_repo.py "${args[@]}"

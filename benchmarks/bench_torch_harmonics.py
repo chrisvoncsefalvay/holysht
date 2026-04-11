@@ -2,6 +2,11 @@
 """
 Benchmark HOLYSHT vs torch-harmonics: correctness + performance.
 
+Author: Chris von Csefalvay
+Licence: MIT
+Repository: https://github.com/chrisvoncsefalvay/holysht
+Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
+
 Mirrors the workloads found in torch-harmonics notebooks:
   - getting_started.ipynb:      RealSHT / InverseRealSHT roundtrip
   - partial_derivatives.ipynb:  RealVectorSHT / InverseRealVectorSHT
@@ -14,7 +19,6 @@ Run:
 Outputs a Markdown-friendly table to stdout and writes structured JSON to
 data/bench_torch_harmonics.json.
 """
-# Author: Chris von Csefalvay <chris@chrisvoncsefalvay.com>
 
 import argparse
 import json
@@ -140,6 +144,8 @@ def estimate_case_allocation_bytes(test_name: str, nlat: int, nlon: int, batch_s
         total = 3 * weight_fp32 + coeff + 2 * fft + 2 * spatial
     elif test_name == "RealSHT.forward (BF16)":
         total = (weight_fp32 + weight_bf16 + weight_fp32) + 2 * spatial + 2 * fft + 2 * coeff
+    elif test_name == "RealVectorSHT.forward (BF16)":
+        total = 2 * (weight_fp32 + weight_bf16 + weight_fp32) + 2 * spatial_vec + 4 * fft + 4 * coeff_vec
     elif test_name == "RealSHT.forward+backward":
         total = 3 * weight_fp32 + 5 * spatial + 6 * coeff + 4 * fft
     elif test_name == "RealVectorSHT.forward+backward":
@@ -200,6 +206,47 @@ GRIDS_QUICK = [
 ]
 
 BATCH_SIZES = [1, 4]
+
+SCENARIO_NAMES = {
+    "scalar-forward",
+    "scalar-inverse",
+    "roundtrip",
+    "vector-forward",
+    "vector-inverse",
+    "ynm",
+    "bf16-forward",
+    "scalar-train",
+    "vector-train",
+}
+
+
+def parse_grid_list(raw: Optional[str]) -> Optional[List[tuple[int, int]]]:
+    if raw is None:
+        return None
+    grids = []
+    for item in raw.split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        nlat_str, nlon_str = item.split("x", 1)
+        grids.append((int(nlat_str), int(nlon_str)))
+    return grids
+
+
+def parse_int_list(raw: Optional[str]) -> Optional[List[int]]:
+    if raw is None:
+        return None
+    return [int(item.strip()) for item in raw.split(",") if item.strip()]
+
+
+def parse_scenarios(raw: str) -> set[str]:
+    if raw.strip().lower() == "all":
+        return set(SCENARIO_NAMES)
+    scenarios = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    unknown = sorted(scenarios - SCENARIO_NAMES)
+    if unknown:
+        raise ValueError(f"Unknown scenarios: {', '.join(unknown)}")
+    return scenarios
 
 
 def bench_scalar_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[BenchResult]:
@@ -503,6 +550,44 @@ def bench_bf16_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
     return results
 
 
+def bench_bf16_vector_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
+    """BF16 vector path on top of the custom CUDA real reductions."""
+    results = []
+    B = 4
+    for nlat, nlon in grids:
+        if should_skip_case("RealVectorSHT.forward (BF16)", nlat, nlon, B):
+            continue
+        ref_vsht = RealVectorSHT(nlat, nlon).to(DEVICE)
+        fused_bf16 = HollyRealVectorSHT(nlat, nlon, dtype="bf16").to(DEVICE)
+
+        x = torch.randn(B, 2, nlat, nlon, device=DEVICE)
+        with torch.no_grad():
+            ref_out = ref_vsht(x)
+            bf16_out = fused_bf16(x)
+        mae = (bf16_out - ref_out).abs().max().item()
+        mre = rel_err(bf16_out, ref_out)
+        ok = mae < 5e-3
+
+        ref_ms = cuda_timer(lambda: ref_vsht(x), n_warmup, n_iters)
+        holysht_ms = cuda_timer(lambda: fused_bf16(x), n_warmup, n_iters)
+
+        results.append(BenchResult(
+            test_name="RealVectorSHT.forward (BF16)",
+            grid=f"{nlat}x{nlon}",
+            batch_size=B,
+            ref_ms=round(ref_ms, 4),
+            holysht_ms=round(holysht_ms, 4),
+            speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+            max_abs_err=mae,
+            max_rel_err=mre,
+            correct=ok,
+        ))
+
+        del ref_vsht, fused_bf16, x, ref_out, bf16_out
+        torch.cuda.empty_cache()
+    return results
+
+
 def bench_scalar_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[BenchResult]:
     """Benchmark forward+backward scalar SHT to validate training realism."""
     results = []
@@ -662,6 +747,37 @@ def main():
     parser.add_argument("--output", default=None,
                         help="JSON output path (default: data/bench_torch_harmonics.json)")
     parser.add_argument(
+        "--scenarios",
+        default="all",
+        help=(
+            "Comma-separated scenarios to run. "
+            "Choices: scalar-forward, scalar-inverse, roundtrip, vector-forward, "
+            "vector-inverse, ynm, bf16-forward, scalar-train, vector-train, or all."
+        ),
+    )
+    parser.add_argument(
+        "--grids",
+        default=None,
+        help="Comma-separated grids such as 256x512,512x1024. Applies to grid-based scenarios.",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        default=None,
+        help="Comma-separated batch sizes such as 1,4.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="Override the number of warmup iterations.",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=None,
+        help="Override the number of timed iterations.",
+    )
+    parser.add_argument(
         "--max-alloc-gib",
         type=float,
         default=DEFAULT_MAX_ALLOC_GIB,
@@ -677,10 +793,15 @@ def main():
     MAX_CASE_ALLOC_BYTES = None if args.max_alloc_gib <= 0 else int(args.max_alloc_gib * GiB)
     SKIPPED_CASES.clear()
 
-    grids = GRIDS_QUICK if args.quick else GRIDS_FULL
-    batch_sizes = [1, 4] if not args.quick else [4]
-    n_warmup = 10 if args.quick else 20
-    n_iters = 50 if args.quick else 100
+    try:
+        selected_scenarios = parse_scenarios(args.scenarios)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    grids = parse_grid_list(args.grids) or (GRIDS_QUICK if args.quick else GRIDS_FULL)
+    batch_sizes = parse_int_list(args.batch_sizes) or ([4] if args.quick else [1, 4])
+    n_warmup = args.warmup if args.warmup is not None else (10 if args.quick else 20)
+    n_iters = args.iters if args.iters is not None else (50 if args.quick else 100)
 
     # GPU info
     gpu_name = torch.cuda.get_device_name(0)
@@ -691,6 +812,8 @@ def main():
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA: {torch.version.cuda}")
     print(f"Grids: {grids}")
+    print(f"Batch sizes: {batch_sizes}")
+    print(f"Scenarios: {sorted(selected_scenarios)}")
     print(f"Iterations: {n_iters} (warmup: {n_warmup})")
     if MAX_CASE_ALLOC_BYTES is None:
         print("Allocation cap: disabled")
@@ -703,69 +826,76 @@ def main():
 
     all_results: List[BenchResult] = []
 
-    # --- Scalar SHT ---
-    print("## Scalar SHT (Forward)")
-    r = bench_scalar_sht(grids, batch_sizes, n_warmup, n_iters)
-    print_table(r)
-    all_results.extend(r)
-    print()
+    if "scalar-forward" in selected_scenarios:
+        print("## Scalar SHT (forward)")
+        r = bench_scalar_sht(grids, batch_sizes, n_warmup, n_iters)
+        print_table(r)
+        all_results.extend(r)
+        print()
 
-    # --- Scalar ISHT ---
-    print("## Scalar SHT (Inverse)")
-    r = bench_scalar_isht(grids, batch_sizes, n_warmup, n_iters)
-    print_table(r)
-    all_results.extend(r)
-    print()
+    if "scalar-inverse" in selected_scenarios:
+        print("## Scalar SHT (inverse)")
+        r = bench_scalar_isht(grids, batch_sizes, n_warmup, n_iters)
+        print_table(r)
+        all_results.extend(r)
+        print()
 
-    # --- Roundtrip ---
-    print("## Roundtrip (Forward + Inverse)")
-    r = bench_roundtrip(grids, batch_sizes, n_warmup, n_iters)
-    print_table(r)
-    all_results.extend(r)
-    print()
+    if "roundtrip" in selected_scenarios:
+        print("## Roundtrip (forward + inverse)")
+        r = bench_roundtrip(grids, batch_sizes, n_warmup, n_iters)
+        print_table(r)
+        all_results.extend(r)
+        print()
 
-    # --- Vector SHT ---
-    print("## Vector SHT (Forward)")
-    r = bench_vector_sht(grids, batch_sizes, n_warmup, n_iters)
-    print_table(r)
-    all_results.extend(r)
-    print()
+    if "vector-forward" in selected_scenarios:
+        print("## Vector SHT (forward)")
+        r = bench_vector_sht(grids, batch_sizes, n_warmup, n_iters)
+        print_table(r)
+        all_results.extend(r)
+        print()
 
-    # --- Vector ISHT ---
-    print("## Vector SHT (Inverse)")
-    r = bench_vector_isht(grids, batch_sizes, n_warmup, n_iters)
-    print_table(r)
-    all_results.extend(r)
-    print()
+    if "vector-inverse" in selected_scenarios:
+        print("## Vector SHT (inverse)")
+        r = bench_vector_isht(grids, batch_sizes, n_warmup, n_iters)
+        print_table(r)
+        all_results.extend(r)
+        print()
 
-    # --- Y_n^m synthesis ---
-    print("## Y_n^m Basis Synthesis")
-    r = bench_ynm_synthesis(lmax=64, n_warmup=n_warmup, n_iters=n_iters)
-    print_table(r)
-    all_results.extend(r)
-    print()
+    if "ynm" in selected_scenarios:
+        print("## Y_n^m basis synthesis")
+        r = bench_ynm_synthesis(lmax=64, n_warmup=n_warmup, n_iters=n_iters)
+        print_table(r)
+        all_results.extend(r)
+        print()
 
-    # --- BF16 ---
-    print("## BF16 Tensor Core Path")
-    bf16_grids = [(512, 1024), (720, 1440)] if not args.quick else [(512, 1024)]
-    r = bench_bf16_sht(bf16_grids, n_warmup, n_iters)
-    print_table(r)
-    all_results.extend(r)
-    print()
+    if "bf16-forward" in selected_scenarios:
+        print("## BF16 tensor core path")
+        bf16_grids = grids if args.grids is not None else ([(512, 1024)] if args.quick else [(512, 1024), (720, 1440)])
+        r = bench_bf16_sht(bf16_grids, n_warmup, n_iters)
+        rv = bench_bf16_vector_sht(bf16_grids, n_warmup, n_iters)
+        print_table(r + rv)
+        all_results.extend(r)
+        all_results.extend(rv)
+        print()
 
-    # --- Training paths ---
-    print("## Scalar SHT Training (Forward + Backward)")
-    train_grids = [(256, 512), (512, 1024), (720, 1440)] if not args.quick else [(256, 512)]
-    r = bench_scalar_train(train_grids, [4], max(5, n_warmup // 2), max(20, n_iters // 2))
-    print_table(r)
-    all_results.extend(r)
-    print()
+    train_warmup = max(5, n_warmup // 2)
+    train_iters = max(20, n_iters // 2)
+    train_grids = grids if args.grids is not None else ([(256, 512)] if args.quick else [(256, 512), (512, 1024), (720, 1440)])
+    train_batch_sizes = batch_sizes if args.batch_sizes is not None else [4]
 
-    print("## Vector SHT Training (Forward + Backward)")
-    r = bench_vector_train(train_grids, [4], max(5, n_warmup // 2), max(20, n_iters // 2))
-    print_table(r)
-    all_results.extend(r)
-    print()
+    if "scalar-train" in selected_scenarios:
+        print("## Scalar SHT training (forward + backward)")
+        r = bench_scalar_train(train_grids, train_batch_sizes, train_warmup, train_iters)
+        print_table(r)
+        all_results.extend(r)
+        print()
+
+    if "vector-train" in selected_scenarios:
+        print("## Vector SHT training (forward + backward)")
+        r = bench_vector_train(train_grids, train_batch_sizes, train_warmup, train_iters)
+        print_table(r)
+        all_results.extend(r)
+        print()
 
     # --- Summary ---
     print_summary(all_results)

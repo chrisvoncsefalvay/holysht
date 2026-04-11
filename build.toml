@@ -1,7 +1,13 @@
+# HOLYSHT
+# Author: Chris von Csefalvay
+# Licence: MIT
+# Repository: https://github.com/chrisvoncsefalvay/holysht
+# Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
+
 [general]
 name = "holysht"
 version = 1
-license = "apache-2.0"
+license = "mit"
 upstream = "https://github.com/NVIDIA/torch-harmonics"
 backends = ["cuda"]
 
@@ -12,6 +18,8 @@ repo-id = "chrisvoncsefalvay/holysht"
 src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
+    "torch-ext/registration_select.h",
+    "torch-ext/local_registration.h",
 ]
 pyext = ["py"]
 
@@ -19,12 +27,12 @@ pyext = ["py"]
 backend = "cuda"
 depends = ["torch"]
 src = ["cuda/fused_legendre.cu"]
-cuda-capabilities = ["12.0", "12.1"]
-cuda-flags = ["-O3", "--use_fast_math"]
+cuda-capabilities = ["12.0"]
+cuda-flags = ["-O3", "-lineinfo", "-Xptxas=-warn-spills", "--use_fast_math"]
 
 [kernel.holysht_sht]
 backend = "cuda"
 depends = ["torch"]
 src = ["cuda/fused_sht.cu"]
-cuda-capabilities = ["12.0", "12.1"]
-cuda-flags = ["-O3", "--use_fast_math"]
+cuda-capabilities = ["12.0"]
+cuda-flags = ["-O3", "-lineinfo", "-Xptxas=-warn-spills", "--use_fast_math"]

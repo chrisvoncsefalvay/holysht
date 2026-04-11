@@ -1,3 +1,9 @@
+# HOLYSHT
+# Author: Chris von Csefalvay
+# Licence: MIT
+# Repository: https://github.com/chrisvoncsefalvay/holysht
+# Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
+
 __pycache__/
 .pytest_cache/
 *.pyc
@@ -5,3 +11,12 @@ __pycache__/
 build/
 dist/
 data/*.json
+data/profiles/
+data/*.jpg
+data/*.tif
+data/*.png
+examples/.reference/
+examples/*.mp4
+examples/*frames_*.png
+data/mola_topo.jpg
+scripts/__pycache__/
