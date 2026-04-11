@@ -62,6 +62,44 @@ TRAIL_LEN = 8       # fewer past positions per trail (shorter tails)
 ADVECT_DT = 0.10    # advection step size per frame
 
 
+def rgba_to_transparent_gif_frame(frame, transparency_threshold=8):
+    """Convert an RGBA frame into a paletted GIF frame with real transparency.
+
+    Pillow's implicit RGBA-to-GIF path often mattes transparent pixels against
+    white. We quantise explicitly, reserve palette index 0 for transparency,
+    and premultiply against black so the antialiased edge does not pick up a
+    light halo.
+    """
+    rgba = np.asarray(frame.convert("RGBA"), dtype=np.uint8)
+    alpha = rgba[..., 3]
+
+    # Premultiply against black before quantisation so transparent edges do not
+    # inherit a white matte during the GIF conversion.
+    rgb = (
+        (rgba[..., :3].astype(np.uint16) * alpha[..., None].astype(np.uint16) + 127) // 255
+    ).astype(np.uint8)
+
+    quantised = Image.fromarray(rgb).quantize(
+        colors=255,
+        method=Image.Quantize.MEDIANCUT,
+        dither=Image.Dither.NONE,
+    )
+
+    indices = np.asarray(quantised, dtype=np.uint8) + 1
+    indices[alpha <= transparency_threshold] = 0
+
+    height, width = indices.shape
+    gif_frame = Image.frombytes("P", (width, height), indices.tobytes())
+    source_palette = quantised.getpalette() or []
+    palette = [0, 0, 0] + source_palette[:255 * 3]
+    if len(palette) < 768:
+        palette.extend([0] * (768 - len(palette)))
+    gif_frame.putpalette(palette[:768])
+    gif_frame.info["transparency"] = 0
+    gif_frame.info["disposal"] = 2
+    return gif_frame
+
+
 def make_mars_topography():
     """Load real Mars topography from MOLA DEM image.
 
@@ -784,7 +822,6 @@ def main():
     plt.close(fig)
     print("Building loopable gif with crossfade...")
     try:
-        from PIL import Image as PILImage
         import io
 
         XFADE = int(FPS * 1.0)  # 1 second crossfade
@@ -848,7 +885,7 @@ def main():
             buf_io.seek(0)
             w_px = int(fig2.get_figwidth() * 100)
             h_px = int(fig2.get_figheight() * 100)
-            frame_img = PILImage.frombytes("RGBA", (w_px, h_px), buf_io.read())
+            frame_img = Image.frombytes("RGBA", (w_px, h_px), buf_io.read())
             pil_frames.append(frame_img)
 
             if (fi + 1) % 60 == 0:
@@ -860,7 +897,7 @@ def main():
         for i in range(XFADE):
             alpha = i / XFADE  # 0 at start of fade region, 1 at end
             tail_idx = N_FRAMES - XFADE + i
-            blended = PILImage.blend(pil_frames[tail_idx], pil_frames[i], alpha)
+            blended = Image.blend(pil_frames[tail_idx], pil_frames[i], alpha)
             pil_frames[tail_idx] = blended
 
         # Trim the overlapping head frames so the loop is clean
@@ -871,10 +908,12 @@ def main():
         # frames 0..N-XFADE-1 are untouched, frames N-XFADE..N-1 are blended toward frame 0..XFADE-1
         # We keep all N frames. When the gif loops, frame N-1 (≈frame XFADE-1) flows into frame 0.
         loop_frames = pil_frames
+        gif_frames = [rgba_to_transparent_gif_frame(frame) for frame in loop_frames]
 
-        loop_frames[0].save(
-            gif_path, save_all=True, append_images=loop_frames[1:],
+        gif_frames[0].save(
+            gif_path, save_all=True, append_images=gif_frames[1:],
             duration=1000 // FPS, loop=0, transparency=0, disposal=2,
+            optimize=False,
         )
         print(f"Saved: {gif_path}")
     except Exception as e:
