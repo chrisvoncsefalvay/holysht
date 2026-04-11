@@ -1,10 +1,5 @@
 # HOLYSHT: highly optimised Legendre $Y_l^m$ SHT
 
-Author: Chris von Csefalvay
-Licence: MIT
-Repository: https://github.com/chrisvoncsefalvay/holysht
-Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
-
 HOLYSHT is a focused CUDA acceleration layer for spherical harmonic transforms
 in the `torch-harmonics` ecosystem. It keeps the parts that proved real in
 benchmarking: custom CUDA Legendre kernels, dedicated vector SHT kernels,
