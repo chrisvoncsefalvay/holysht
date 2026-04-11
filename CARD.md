@@ -1,20 +1,11 @@
-# HOLYSHT card
-
-Author: Chris von Csefalvay
-Licence: MIT
-Repository: https://github.com/chrisvoncsefalvay/holysht
-Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
-
-## Name
-
-**HOLYSHT**: highly optimised Legendre/Ylm/SHT
+# **HOLYSHT**: highly optimised Legendre/$Y_l^m$/SHT
 
 ## Summary
 
 HOLYSHT is a focused CUDA acceleration layer for spherical harmonic transforms
 in the `torch-harmonics` ecosystem. It accelerates the Legendre stage, vector
 SHT composition, and inverse-FFT preparation rather than replacing the whole
-upstream library.
+upstream library. For more information, [check the repo](https://github.com/chrisvoncsefalvay/holysht).
 
 ## Scope
 
@@ -28,15 +19,10 @@ Included:
 - BF16 forward paths backed by CUDA real-reduction kernels
 - Benchmark, profiling, and parity-test tooling
 
-Intentionally excluded:
-
-- The earlier DISCO fusion work
-- Experimental side-project code
-- Heavy multi-architecture kernel-builder fan-out in normal development
 
 ## Benchmark summary
 
-Measured on 11 April 2026 with PyTorch `2.10.0+cu130`, CUDA `13.0`, batch size
+Measured with PyTorch `2.10.0+cu130`, CUDA `13.0`, batch size
 `4`, an allocation cap of `6 GiB`, and an NVIDIA GB10:
 
 - Scalar forward: up to `4.6x`
