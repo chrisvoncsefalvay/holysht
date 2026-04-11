@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+build/
+dist/
+data/*.json
