@@ -1,4 +1,4 @@
-# **HOLYSHT**: highly optimised Legendre/$Y_l^m$/SHT
+# **HOLYSHT**: highly optimised Legendre $Y_l^m$ SHT
 
 ## Summary
 
