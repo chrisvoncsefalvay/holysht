@@ -34,8 +34,6 @@ Measured with PyTorch `2.10.0+cu130`, CUDA `13.0`, batch size
 - BF16 scalar forward: `1.6x`
 - BF16 vector forward: `1.6x`
 
-All `20/20` executed correctness checks passed in that quick sweep.
-
 ## Core techniques
 
 1. Architecture-aware launch selection between `tile_l=4` and `tile_l=8`.
