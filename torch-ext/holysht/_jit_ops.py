@@ -100,6 +100,7 @@ def _load_ops():
             extra_include_paths=[str(_ROOT / "torch-ext")],
             extra_cflags=["-O3", "-std=c++17"],
             extra_cuda_cflags=_cuda_flags(),
+            extra_ldflags=["-lcuda"],  # CUDA driver API for TMA (cuTensorMapEncodeTiled)
             build_directory=str(_BUILD_DIR),
             verbose=verbose,
             with_cuda=True,

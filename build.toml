@@ -27,14 +27,14 @@ pyext = ["py"]
 backend = "cuda"
 depends = ["torch"]
 src = ["cuda/fused_legendre.cu"]
-cuda-capabilities = ["12.0"]
+cuda-capabilities = ["9.0a", "10.0a", "12.0"]
 cuda-flags = ["-O3", "-lineinfo", "-Xptxas=-warn-spills", "--use_fast_math"]
 
 [kernel.holysht_sht]
 backend = "cuda"
 depends = ["torch"]
 src = ["cuda/fused_sht.cu"]
-cuda-capabilities = ["12.0"]
+cuda-capabilities = ["9.0a", "10.0a", "12.0"]
 cuda-flags = ["-O3", "-lineinfo", "-Xptxas=-warn-spills", "--use_fast_math"]
 
 [kernel.holysht_legendre_metal]
