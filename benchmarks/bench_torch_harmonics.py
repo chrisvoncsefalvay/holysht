@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
@@ -51,7 +52,29 @@ from holysht import (
     InverseRealVectorSHT as HollyInverseRealVectorSHT,
 )
 
-DEVICE = torch.device("cuda")
+def has_mps() -> bool:
+    return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+
+def resolve_device(requested: str) -> torch.device:
+    requested = requested.lower()
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if has_mps():
+            return torch.device("mps")
+    elif requested == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        raise RuntimeError("CUDA was requested but is not available.")
+    elif requested == "mps":
+        if has_mps():
+            return torch.device("mps")
+        raise RuntimeError("MPS was requested but is not available.")
+    raise RuntimeError("No supported GPU backend is available. Expected CUDA or MPS.")
+
+
+DEVICE = resolve_device(os.environ.get("HOLYSHT_DEVICE", "auto"))
 GiB = 1024 ** 3
 DEFAULT_MAX_ALLOC_GIB = float(os.environ.get("HOLYSHT_MAX_ALLOC_GIB", "6.0"))
 MEMORY_SAFETY_FACTOR = 1.2
@@ -75,22 +98,59 @@ class BenchResult:
     correct: bool
 
 
-def cuda_timer(fn, n_warmup=20, n_iters=100):
+def to_device_module(module: torch.nn.Module) -> torch.nn.Module:
+    if DEVICE.type == "mps":
+        for name, buf in list(module._buffers.items()):
+            if buf is None:
+                continue
+            if buf.is_floating_point():
+                module._buffers[name] = buf.float()
+            elif buf.is_complex():
+                module._buffers[name] = buf.to(torch.complex64)
+    return module.to(DEVICE)
+
+
+def synchronize_device():
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    elif DEVICE.type == "mps":
+        torch.mps.synchronize()
+
+
+def empty_device_cache():
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+    elif DEVICE.type == "mps" and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+
+def device_timer(fn, n_warmup=20, n_iters=100):
     """Median-of-n GPU time in milliseconds."""
     for _ in range(n_warmup):
         fn()
-    torch.cuda.synchronize()
+    synchronize_device()
 
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
+    if DEVICE.type == "cuda":
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_iters)]
 
-    for i in range(n_iters):
-        starts[i].record()
+        for i in range(n_iters):
+            starts[i].record()
+            fn()
+            ends[i].record()
+        synchronize_device()
+
+        times = sorted(starts[i].elapsed_time(ends[i]) for i in range(n_iters))
+        return times[n_iters // 2]
+
+    times = []
+    for _ in range(n_iters):
+        synchronize_device()
+        start = time.perf_counter()
         fn()
-        ends[i].record()
-    torch.cuda.synchronize()
-
-    times = sorted(starts[i].elapsed_time(ends[i]) for i in range(n_iters))
+        synchronize_device()
+        times.append((time.perf_counter() - start) * 1000.0)
+    times.sort()
     return times[n_iters // 2]  # median
 
 
@@ -256,8 +316,8 @@ def bench_scalar_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
         for B in batch_sizes:
             if should_skip_case("RealSHT.forward", nlat, nlon, B):
                 continue
-            ref_sht = RealSHT(nlat, nlon).to(DEVICE)
-            fused_sht = HollyRealSHT(nlat, nlon).to(DEVICE)
+            ref_sht = to_device_module(RealSHT(nlat, nlon))
+            fused_sht = to_device_module(HollyRealSHT(nlat, nlon))
             x = torch.randn(B, nlat, nlon, device=DEVICE)
 
             # Correctness
@@ -269,8 +329,8 @@ def bench_scalar_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
             ok = mae < 1e-3
 
             # Performance
-            ref_ms = cuda_timer(lambda: ref_sht(x), n_warmup, n_iters)
-            holysht_ms = cuda_timer(lambda: fused_sht(x), n_warmup, n_iters)
+            ref_ms = device_timer(lambda: ref_sht(x), n_warmup, n_iters)
+            holysht_ms = device_timer(lambda: fused_sht(x), n_warmup, n_iters)
 
             results.append(BenchResult(
                 test_name="RealSHT.forward",
@@ -285,7 +345,7 @@ def bench_scalar_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
             ))
 
             del ref_sht, fused_sht, x, ref_out, fused_out
-            torch.cuda.empty_cache()
+            empty_device_cache()
     return results
 
 
@@ -296,9 +356,9 @@ def bench_scalar_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
         for B in batch_sizes:
             if should_skip_case("InverseRealSHT.forward", nlat, nlon, B):
                 continue
-            ref_sht = RealSHT(nlat, nlon).to(DEVICE)
-            ref_isht = InverseRealSHT(nlat, nlon).to(DEVICE)
-            fused_isht = HollyInverseRealSHT(nlat, nlon).to(DEVICE)
+            ref_sht = to_device_module(RealSHT(nlat, nlon))
+            ref_isht = to_device_module(InverseRealSHT(nlat, nlon))
+            fused_isht = to_device_module(HollyInverseRealSHT(nlat, nlon))
 
             x = torch.randn(B, nlat, nlon, device=DEVICE)
             with torch.no_grad():
@@ -309,8 +369,8 @@ def bench_scalar_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
             mre = rel_err(fused_out, ref_out)
             ok = mae < 1e-2
 
-            ref_ms = cuda_timer(lambda: ref_isht(coeffs), n_warmup, n_iters)
-            holysht_ms = cuda_timer(lambda: fused_isht(coeffs), n_warmup, n_iters)
+            ref_ms = device_timer(lambda: ref_isht(coeffs), n_warmup, n_iters)
+            holysht_ms = device_timer(lambda: fused_isht(coeffs), n_warmup, n_iters)
 
             results.append(BenchResult(
                 test_name="InverseRealSHT.forward",
@@ -325,7 +385,7 @@ def bench_scalar_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
             ))
 
             del ref_sht, ref_isht, fused_isht, x, coeffs, ref_out, fused_out
-            torch.cuda.empty_cache()
+            empty_device_cache()
     return results
 
 
@@ -336,10 +396,10 @@ def bench_roundtrip(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[BenchR
         for B in batch_sizes:
             if should_skip_case("Roundtrip(SHT→ISHT)", nlat, nlon, B):
                 continue
-            ref_sht = RealSHT(nlat, nlon).to(DEVICE)
-            ref_isht = InverseRealSHT(nlat, nlon).to(DEVICE)
-            fused_sht = HollyRealSHT(nlat, nlon).to(DEVICE)
-            fused_isht = HollyInverseRealSHT(nlat, nlon).to(DEVICE)
+            ref_sht = to_device_module(RealSHT(nlat, nlon))
+            ref_isht = to_device_module(InverseRealSHT(nlat, nlon))
+            fused_sht = to_device_module(HollyRealSHT(nlat, nlon))
+            fused_isht = to_device_module(HollyInverseRealSHT(nlat, nlon))
 
             x = torch.randn(B, nlat, nlon, device=DEVICE)
 
@@ -361,8 +421,8 @@ def bench_roundtrip(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[BenchR
             def fused_fn():
                 fused_isht(fused_sht(x))
 
-            ref_ms = cuda_timer(ref_fn, n_warmup, n_iters)
-            holysht_ms = cuda_timer(fused_fn, n_warmup, n_iters)
+            ref_ms = device_timer(ref_fn, n_warmup, n_iters)
+            holysht_ms = device_timer(fused_fn, n_warmup, n_iters)
 
             results.append(BenchResult(
                 test_name="Roundtrip(SHT→ISHT)",
@@ -377,7 +437,7 @@ def bench_roundtrip(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[BenchR
             ))
 
             del ref_sht, ref_isht, fused_sht, fused_isht, x
-            torch.cuda.empty_cache()
+            empty_device_cache()
     return results
 
 
@@ -388,8 +448,8 @@ def bench_vector_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
         for B in batch_sizes:
             if should_skip_case("RealVectorSHT.forward", nlat, nlon, B):
                 continue
-            ref_vsht = RealVectorSHT(nlat, nlon).to(DEVICE)
-            fused_vsht = HollyRealVectorSHT(nlat, nlon).to(DEVICE)
+            ref_vsht = to_device_module(RealVectorSHT(nlat, nlon))
+            fused_vsht = to_device_module(HollyRealVectorSHT(nlat, nlon))
             x = torch.randn(B, 2, nlat, nlon, device=DEVICE)
 
             with torch.no_grad():
@@ -399,8 +459,8 @@ def bench_vector_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
             mre = rel_err(fused_out, ref_out)
             ok = mae < 1e-3
 
-            ref_ms = cuda_timer(lambda: ref_vsht(x), n_warmup, n_iters)
-            holysht_ms = cuda_timer(lambda: fused_vsht(x), n_warmup, n_iters)
+            ref_ms = device_timer(lambda: ref_vsht(x), n_warmup, n_iters)
+            holysht_ms = device_timer(lambda: fused_vsht(x), n_warmup, n_iters)
 
             results.append(BenchResult(
                 test_name="RealVectorSHT.forward",
@@ -415,7 +475,7 @@ def bench_vector_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
             ))
 
             del ref_vsht, fused_vsht, x, ref_out, fused_out
-            torch.cuda.empty_cache()
+            empty_device_cache()
     return results
 
 
@@ -426,9 +486,9 @@ def bench_vector_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
         for B in batch_sizes:
             if should_skip_case("InverseRealVectorSHT.forward", nlat, nlon, B):
                 continue
-            ref_vsht = RealVectorSHT(nlat, nlon).to(DEVICE)
-            ref_ivsht = InverseRealVectorSHT(nlat, nlon).to(DEVICE)
-            fused_ivsht = HollyInverseRealVectorSHT(nlat, nlon).to(DEVICE)
+            ref_vsht = to_device_module(RealVectorSHT(nlat, nlon))
+            ref_ivsht = to_device_module(InverseRealVectorSHT(nlat, nlon))
+            fused_ivsht = to_device_module(HollyInverseRealVectorSHT(nlat, nlon))
 
             x = torch.randn(B, 2, nlat, nlon, device=DEVICE)
             with torch.no_grad():
@@ -439,8 +499,8 @@ def bench_vector_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
             mre = rel_err(fused_out, ref_out)
             ok = mae < 1e-2
 
-            ref_ms = cuda_timer(lambda: ref_ivsht(coeffs), n_warmup, n_iters)
-            holysht_ms = cuda_timer(lambda: fused_ivsht(coeffs), n_warmup, n_iters)
+            ref_ms = device_timer(lambda: ref_ivsht(coeffs), n_warmup, n_iters)
+            holysht_ms = device_timer(lambda: fused_ivsht(coeffs), n_warmup, n_iters)
 
             results.append(BenchResult(
                 test_name="InverseRealVectorSHT.forward",
@@ -455,7 +515,7 @@ def bench_vector_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
             ))
 
             del ref_vsht, ref_ivsht, fused_ivsht, x, coeffs, ref_out, fused_out
-            torch.cuda.empty_cache()
+            empty_device_cache()
     return results
 
 
@@ -471,8 +531,8 @@ def bench_ynm_synthesis(lmax=64, n_warmup=20, n_iters=100) -> List[BenchResult]:
     if should_skip_case("Y_n^m synthesis (ISHT, sparse)", nlat, nlon, 1, lmax=lmax, mmax=lmax):
         return results
 
-    ref_isht = InverseRealSHT(nlat, nlon, lmax=lmax, mmax=lmax).to(DEVICE)
-    fused_isht = HollyInverseRealSHT(nlat, nlon, lmax=lmax, mmax=lmax).to(DEVICE)
+    ref_isht = to_device_module(InverseRealSHT(nlat, nlon, lmax=lmax, mmax=lmax))
+    fused_isht = to_device_module(HollyInverseRealSHT(nlat, nlon, lmax=lmax, mmax=lmax))
 
     # Test a selection of (n, m) modes
     test_modes = [(0, 0), (1, 0), (1, 1), (4, 2), (10, 5), (lmax-1, 0), (lmax-1, lmax-1)]
@@ -490,8 +550,8 @@ def bench_ynm_synthesis(lmax=64, n_warmup=20, n_iters=100) -> List[BenchResult]:
 
     ok = max_err_overall < 1e-3
 
-    ref_ms = cuda_timer(lambda: ref_isht(coeffs), n_warmup, n_iters)
-    holysht_ms = cuda_timer(lambda: fused_isht(coeffs), n_warmup, n_iters)
+    ref_ms = device_timer(lambda: ref_isht(coeffs), n_warmup, n_iters)
+    holysht_ms = device_timer(lambda: fused_isht(coeffs), n_warmup, n_iters)
 
     results.append(BenchResult(
         test_name="Y_n^m synthesis (ISHT, sparse)",
@@ -506,19 +566,22 @@ def bench_ynm_synthesis(lmax=64, n_warmup=20, n_iters=100) -> List[BenchResult]:
     ))
 
     del ref_isht, fused_isht
-    torch.cuda.empty_cache()
+    empty_device_cache()
     return results
 
 
 def bench_bf16_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
     """BF16 tensor-core path — tests additional speedup from lower precision."""
+    if DEVICE.type != "cuda":
+        print("Skipping BF16 benchmark on non-CUDA backend.")
+        return []
     results = []
     B = 4
     for nlat, nlon in grids:
         if should_skip_case("RealSHT.forward (BF16)", nlat, nlon, B):
             continue
-        ref_sht = RealSHT(nlat, nlon).to(DEVICE)
-        fused_bf16 = HollyRealSHT(nlat, nlon, dtype="bf16").to(DEVICE)
+        ref_sht = to_device_module(RealSHT(nlat, nlon))
+        fused_bf16 = to_device_module(HollyRealSHT(nlat, nlon, dtype="bf16"))
 
         x = torch.randn(B, nlat, nlon, device=DEVICE)
         with torch.no_grad():
@@ -530,8 +593,8 @@ def bench_bf16_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
         # (relative error is misleading for near-zero spectral coefficients)
         ok = mae < 5e-3
 
-        ref_ms = cuda_timer(lambda: ref_sht(x), n_warmup, n_iters)
-        holysht_ms = cuda_timer(lambda: fused_bf16(x), n_warmup, n_iters)
+        ref_ms = device_timer(lambda: ref_sht(x), n_warmup, n_iters)
+        holysht_ms = device_timer(lambda: fused_bf16(x), n_warmup, n_iters)
 
         results.append(BenchResult(
             test_name="RealSHT.forward (BF16)",
@@ -546,19 +609,22 @@ def bench_bf16_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
         ))
 
         del ref_sht, fused_bf16, x, ref_out, bf16_out
-        torch.cuda.empty_cache()
+        empty_device_cache()
     return results
 
 
 def bench_bf16_vector_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
     """BF16 vector path on top of the custom CUDA real reductions."""
+    if DEVICE.type != "cuda":
+        print("Skipping BF16 vector benchmark on non-CUDA backend.")
+        return []
     results = []
     B = 4
     for nlat, nlon in grids:
         if should_skip_case("RealVectorSHT.forward (BF16)", nlat, nlon, B):
             continue
-        ref_vsht = RealVectorSHT(nlat, nlon).to(DEVICE)
-        fused_bf16 = HollyRealVectorSHT(nlat, nlon, dtype="bf16").to(DEVICE)
+        ref_vsht = to_device_module(RealVectorSHT(nlat, nlon))
+        fused_bf16 = to_device_module(HollyRealVectorSHT(nlat, nlon, dtype="bf16"))
 
         x = torch.randn(B, 2, nlat, nlon, device=DEVICE)
         with torch.no_grad():
@@ -568,8 +634,8 @@ def bench_bf16_vector_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
         mre = rel_err(bf16_out, ref_out)
         ok = mae < 5e-3
 
-        ref_ms = cuda_timer(lambda: ref_vsht(x), n_warmup, n_iters)
-        holysht_ms = cuda_timer(lambda: fused_bf16(x), n_warmup, n_iters)
+        ref_ms = device_timer(lambda: ref_vsht(x), n_warmup, n_iters)
+        holysht_ms = device_timer(lambda: fused_bf16(x), n_warmup, n_iters)
 
         results.append(BenchResult(
             test_name="RealVectorSHT.forward (BF16)",
@@ -584,7 +650,7 @@ def bench_bf16_vector_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
         ))
 
         del ref_vsht, fused_bf16, x, ref_out, bf16_out
-        torch.cuda.empty_cache()
+        empty_device_cache()
     return results
 
 
@@ -595,8 +661,8 @@ def bench_scalar_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
         for B in batch_sizes:
             if should_skip_case("RealSHT.forward+backward", nlat, nlon, B):
                 continue
-            ref_sht = RealSHT(nlat, nlon).to(DEVICE)
-            fused_sht = HollyRealSHT(nlat, nlon).to(DEVICE)
+            ref_sht = to_device_module(RealSHT(nlat, nlon))
+            fused_sht = to_device_module(HollyRealSHT(nlat, nlon))
 
             x_base = torch.randn(B, nlat, nlon, device=DEVICE)
             x_ref = x_base.clone().requires_grad_(True)
@@ -619,8 +685,8 @@ def bench_scalar_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
                 x_fused.grad = None
                 complex_energy(fused_sht(x_fused)).backward()
 
-            ref_ms = cuda_timer(ref_fn, n_warmup, n_iters)
-            holysht_ms = cuda_timer(holysht_fn, n_warmup, n_iters)
+            ref_ms = device_timer(ref_fn, n_warmup, n_iters)
+            holysht_ms = device_timer(holysht_fn, n_warmup, n_iters)
 
             results.append(BenchResult(
                 test_name="RealSHT.forward+backward",
@@ -635,7 +701,7 @@ def bench_scalar_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
             ))
 
             del ref_sht, fused_sht, x_base, x_ref, x_fused, ref_grad, fused_grad
-            torch.cuda.empty_cache()
+            empty_device_cache()
     return results
 
 
@@ -646,8 +712,8 @@ def bench_vector_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
         for B in batch_sizes:
             if should_skip_case("RealVectorSHT.forward+backward", nlat, nlon, B):
                 continue
-            ref_vsht = RealVectorSHT(nlat, nlon).to(DEVICE)
-            fused_vsht = HollyRealVectorSHT(nlat, nlon).to(DEVICE)
+            ref_vsht = to_device_module(RealVectorSHT(nlat, nlon))
+            fused_vsht = to_device_module(HollyRealVectorSHT(nlat, nlon))
 
             x_base = torch.randn(B, 2, nlat, nlon, device=DEVICE)
             x_ref = x_base.clone().requires_grad_(True)
@@ -670,8 +736,8 @@ def bench_vector_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
                 x_fused.grad = None
                 complex_energy(fused_vsht(x_fused)).backward()
 
-            ref_ms = cuda_timer(ref_fn, n_warmup, n_iters)
-            holysht_ms = cuda_timer(holysht_fn, n_warmup, n_iters)
+            ref_ms = device_timer(ref_fn, n_warmup, n_iters)
+            holysht_ms = device_timer(holysht_fn, n_warmup, n_iters)
 
             results.append(BenchResult(
                 test_name="RealVectorSHT.forward+backward",
@@ -686,7 +752,7 @@ def bench_vector_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
             ))
 
             del ref_vsht, fused_vsht, x_base, x_ref, x_fused, ref_grad, fused_grad
-            torch.cuda.empty_cache()
+            empty_device_cache()
     return results
 
 
@@ -744,6 +810,12 @@ def main():
     parser = argparse.ArgumentParser(description="HOLYSHT vs torch-harmonics benchmark")
     parser.add_argument("--quick", action="store_true",
                         help="Run a smaller subset of grids/iterations")
+    parser.add_argument(
+        "--device",
+        default=os.environ.get("HOLYSHT_DEVICE", "auto"),
+        choices=["auto", "cuda", "mps"],
+        help="Execution backend to benchmark.",
+    )
     parser.add_argument("--output", default=None,
                         help="JSON output path (default: data/bench_torch_harmonics.json)")
     parser.add_argument(
@@ -789,6 +861,9 @@ def main():
     )
     args = parser.parse_args()
 
+    global DEVICE
+    DEVICE = resolve_device(args.device)
+
     global MAX_CASE_ALLOC_BYTES
     MAX_CASE_ALLOC_BYTES = None if args.max_alloc_gib <= 0 else int(args.max_alloc_gib * GiB)
     SKIPPED_CASES.clear()
@@ -804,13 +879,23 @@ def main():
     n_iters = args.iters if args.iters is not None else (50 if args.quick else 100)
 
     # GPU info
-    gpu_name = torch.cuda.get_device_name(0)
-    total_mem_gib = torch.cuda.get_device_properties(0).total_memory / GiB
+    if DEVICE.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        total_mem_gib = torch.cuda.get_device_properties(0).total_memory / GiB
+        backend_version = torch.version.cuda
+    else:
+        gpu_name = "Apple Metal (MPS)"
+        total_mem = getattr(torch.mps, "recommended_max_memory", lambda: 0)()
+        total_mem_gib = total_mem / GiB if total_mem else 0.0
+        backend_version = None
     print(f"# HOLYSHT vs torch-harmonics Benchmark")
-    print(f"GPU: {gpu_name}")
-    print(f"Visible GPU memory: {total_mem_gib:.2f} GiB")
+    print(f"Device: {gpu_name}")
+    if total_mem_gib > 0:
+        print(f"Visible GPU memory: {total_mem_gib:.2f} GiB")
     print(f"PyTorch: {torch.__version__}")
-    print(f"CUDA: {torch.version.cuda}")
+    print(f"Backend: {DEVICE.type}")
+    if backend_version:
+        print(f"CUDA: {backend_version}")
     print(f"Grids: {grids}")
     print(f"Batch sizes: {batch_sizes}")
     print(f"Scenarios: {sorted(selected_scenarios)}")
@@ -908,9 +993,10 @@ def main():
     with open(out_path, "w") as f:
         json.dump({
             "gpu": gpu_name,
+            "backend": DEVICE.type,
             "visible_gpu_memory_gib": round(total_mem_gib, 2),
             "pytorch": torch.__version__,
-            "cuda": torch.version.cuda,
+            "cuda": backend_version,
             "max_alloc_gib": args.max_alloc_gib,
             "memory_safety_factor": MEMORY_SAFETY_FACTOR,
             "skipped_cases": SKIPPED_CASES,

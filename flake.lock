@@ -38,6 +38,7 @@
         "flake-compat": "flake-compat",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
+
         "rust-overlay": "rust-overlay"
       },
       "locked": {

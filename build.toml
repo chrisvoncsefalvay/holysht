@@ -9,7 +9,7 @@ name = "holysht"
 version = 1
 license = "mit"
 upstream = "https://github.com/NVIDIA/torch-harmonics"
-backends = ["cuda"]
+backends = ["cuda", "metal"]
 
 [general.hub]
 repo-id = "chrisvoncsefalvay/holysht"
@@ -36,3 +36,11 @@ depends = ["torch"]
 src = ["cuda/fused_sht.cu"]
 cuda-capabilities = ["12.0"]
 cuda-flags = ["-O3", "-lineinfo", "-Xptxas=-warn-spills", "--use_fast_math"]
+
+[kernel.holysht_legendre_metal]
+backend = "metal"
+depends = ["torch"]
+src = [
+    "metal/fused_legendre.mm",
+    "metal/fused_legendre.metal",
+]

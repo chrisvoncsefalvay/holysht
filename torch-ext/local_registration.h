@@ -8,7 +8,7 @@
 // Used during JIT compilation; the real header is provided by kernel-builder at package time.
 #pragma once
 
-#ifndef CUDA_KERNEL
+#if !defined(CPU_KERNEL) && !defined(CUDA_KERNEL) && !defined(ROCM_KERNEL) && !defined(METAL_KERNEL) && !defined(XPU_KERNEL)
 #define CUDA_KERNEL
 #endif
 

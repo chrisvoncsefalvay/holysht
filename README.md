@@ -1,16 +1,17 @@
 # HOLYSHT: highly optimised Legendre $Y_l^m$ SHT
 
-HOLYSHT is a focused CUDA acceleration layer for spherical harmonic transforms
+HOLYSHT is a focused GPU acceleration layer for spherical harmonic transforms
 in the `torch-harmonics` ecosystem. It keeps the parts that proved real in
-benchmarking: custom CUDA Legendre kernels, dedicated vector SHT kernels,
-explicit autograd support, mixed-precision forward paths, and a profiling setup
-that can be run safely on a GB10 without blowing memory.
+benchmarking: custom CUDA Legendre kernels, an Apple Metal/MPS backend for
+arm64 Macs, dedicated vector SHT kernels, explicit autograd support,
+mixed-precision forward paths, and a profiling setup that can be run safely on
+a GB10 without blowing memory.
 
 The package is designed as a practical companion to
 [`torch-harmonics`](https://github.com/NVIDIA/torch-harmonics), not a full
 reimplementation. HOLYSHT still reuses `torch-harmonics` to generate quadrature
-weights, then replaces the slowest execution paths with CUDA code tuned for the
-current Blackwell-era target.
+weights, then replaces the slowest execution paths with backend-specific code
+tuned for the current target.
 
 <p align="center">
   <img src="examples/mars_weather.gif" alt="Martian weather simulation using HOLYSHT — spectral advection on a 256×512 grid with real MOLA topography" width="800">
@@ -26,8 +27,10 @@ current Blackwell-era target.
 - `cuda/`
   CUDA kernels for scalar Legendre, vector Legendre composition, BF16 real
   reductions, and inverse-FFT preparation.
+- `metal/`
+  Metal kernels and the Objective-C++ MPS bridge used on Apple Silicon.
 - `torch-ext/torch_binding.cpp`
-  Torch extension registration for the CUDA ops.
+  Torch extension registration for CUDA and Metal/MPS ops.
 - `benchmarks/`
   End-to-end benchmarks for forward, inverse, training, and BF16 paths.
 - `scripts/`
@@ -41,6 +44,11 @@ current Blackwell-era target.
 
 Benchmarked on an NVIDIA GB10 with PyTorch 2.10.0+cu130, CUDA 13.0, batch
 size 4. All 20 correctness checks passed; mean speedup **3.9x**.
+
+On Apple Silicon, the Metal backend is validated on an Apple M4 Mac mini with
+PyTorch 2.11.0. The quick MPS benchmark passes all 18 correctness checks with a
+mean speedup of **1.7x** over `torch-harmonics`, peaking at **2.6x** for vector
+forward SHT on `512x1024`.
 
 <p align="center">
   <img src="assets/speedup.png" alt="Speedup factors across all benchmark cases" width="600">
@@ -153,6 +161,24 @@ paths.
 - The default CUDA path now uses architecture-aware launch selection with
   runtime-tunable `HOLYSHT_TILE_L` and `HOLYSHT_SMALL_GRID_THRESHOLD`
   overrides.
+- The Metal path uses a hybrid dispatch policy on MPS:
+  small-grid scalar transforms use the custom Metal kernel, larger scalar
+  transforms fall back to the stacked einsum path, vector forward keeps the
+  native real-kernel composition, and vector inverse uses the native path on
+  the tuned mid-size grid range.
+- `HOLYSHT_MPS_SCALAR_NATIVE_MAX_NLAT` overrides the scalar-MPS cutoff
+  (`64` by default).
+- `HOLYSHT_MPS_SCALAR_INVERSE_EINSUM_M_CHUNK` and
+  `HOLYSHT_MPS_SCALAR_FORWARD_EINSUM_M_CHUNK` force chunked MPS fallback
+  contractions over the spectral `m` dimension when unified-memory pressure is
+  more important than raw latency.
+- `HOLYSHT_MPS_SCALAR_INVERSE_EINSUM_CHUNK_THRESHOLD_MB` controls the automatic
+  inverse-fallback chunking threshold (`1024` MiB by default). Below that size
+  HOLYSHT keeps the single-shot MPS contraction.
+- `HOLYSHT_MPS_VECTOR_INVERSE_NATIVE_MAX_NLAT` overrides the vector-inverse
+  MPS cutoff (`512` by default).
+- `HOLYSHT_MPS_VECTOR_INVERSE_NATIVE=1` forces the native Metal vector-inverse
+  path for tuning experiments; `=0` forces the fallback path.
 - `HOLYSHT_ENABLE_NVTX=1` enables NVTX ranges around the public hot paths.
 - `HOLYSHT_USE_FAST_MATH=0` disables `--use_fast_math` for the local JIT build.
 - `build.toml` is pinned to `sm_120` for the kernel-builder path so it no
@@ -164,6 +190,7 @@ paths.
 
 ```bash
 PYTHONPATH=torch-ext python3 benchmarks/bench_torch_harmonics.py --quick --max-alloc-gib 6
+PYTHONPATH=torch-ext python3 benchmarks/bench_torch_harmonics.py --quick --device mps
 ```
 
 To profile a single case:

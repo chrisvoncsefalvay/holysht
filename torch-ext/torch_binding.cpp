@@ -27,6 +27,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.impl("fused_vector_legendre_forward", torch::kCUDA, &fused_vector_legendre_forward);
     ops.impl("fused_vector_legendre_inverse", torch::kCUDA, &fused_vector_legendre_inverse);
     ops.impl("sht_prepare_irfft", torch::kCUDA, &sht_prepare_irfft);
+#elif defined(METAL_KERNEL)
+    ops.impl("fused_legendre_forward", torch::kMPS, &fused_legendre_forward);
+    ops.impl("fused_legendre_inverse", torch::kMPS, &fused_legendre_inverse);
+    ops.impl("fused_legendre_forward_real", torch::kMPS, &fused_legendre_forward_real);
+    ops.impl("fused_legendre_inverse_real", torch::kMPS, &fused_legendre_inverse_real);
+    ops.impl("fused_vector_legendre_forward", torch::kMPS, &fused_vector_legendre_forward);
+    ops.impl("fused_vector_legendre_inverse", torch::kMPS, &fused_vector_legendre_inverse);
+    ops.impl("sht_prepare_irfft", torch::kMPS, &sht_prepare_irfft);
 #endif
 }
 

@@ -30,20 +30,20 @@ __all__ = [
 # back to the local single-machine JIT loader for development.
 try:
     from ._ops import ops as _ops
-    _HAS_CUDA_EXT = True
+    _HAS_NATIVE_EXT = True
 except ModuleNotFoundError:
     try:
         from ._jit_ops import ops as _ops
-        _HAS_CUDA_EXT = True
+        _HAS_NATIVE_EXT = True
     except ImportError:
-        _HAS_CUDA_EXT = False
+        _HAS_NATIVE_EXT = False
 except ImportError:
-    _HAS_CUDA_EXT = False
+    _HAS_NATIVE_EXT = False
 
 
 def _can_use_cuda_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]) -> bool:
     return (
-        _HAS_CUDA_EXT
+        _HAS_NATIVE_EXT
         and weight_t is not None
         and input.is_cuda
         and weight_t.is_cuda
@@ -53,9 +53,65 @@ def _can_use_cuda_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]
     )
 
 
+def _can_use_metal_complex_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]) -> bool:
+    return (
+        _HAS_NATIVE_EXT
+        and weight_t is not None
+        and input.device.type == "mps"
+        and weight_t.device.type == "mps"
+        and input.dtype == torch.complex64
+        and weight_t.dtype == torch.float32
+        and input.is_contiguous()
+        and weight_t.is_contiguous()
+    )
+
+
+def _can_use_native_complex_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]) -> bool:
+    return _can_use_cuda_legendre(input, weight_t) or _can_use_metal_complex_legendre(input, weight_t)
+
+
+def _mps_scalar_native_max_nlat() -> int:
+    raw = os.environ.get("HOLYSHT_MPS_SCALAR_NATIVE_MAX_NLAT")
+    if raw is None:
+        return 512
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 512
+
+
+def _prefer_metal_scalar_kernel(weight_t: Optional[torch.Tensor]) -> bool:
+    return (
+        weight_t is not None
+        and weight_t.device.type == "mps"
+        and weight_t.size(1) <= _mps_scalar_native_max_nlat()
+    )
+
+
+def _mps_vector_inverse_native_max_nlat() -> int:
+    raw = os.environ.get("HOLYSHT_MPS_VECTOR_INVERSE_NATIVE_MAX_NLAT")
+    if raw is None:
+        return 512
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 512
+
+
+def _prefer_metal_vector_inverse_kernel(input: torch.Tensor, weight_t: Optional[torch.Tensor] = None) -> bool:
+    raw = os.environ.get("HOLYSHT_MPS_VECTOR_INVERSE_NATIVE", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return input.device.type != "mps"
+    if input.device.type != "mps":
+        return True
+    return weight_t is not None and weight_t.size(1) <= _mps_vector_inverse_native_max_nlat()
+
+
 def _can_use_cuda_real_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]) -> bool:
     return (
-        _HAS_CUDA_EXT
+        _HAS_NATIVE_EXT
         and weight_t is not None
         and input.is_cuda
         and weight_t.is_cuda
@@ -66,9 +122,22 @@ def _can_use_cuda_real_legendre(input: torch.Tensor, weight_t: Optional[torch.Te
     )
 
 
+def _can_use_metal_real_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]) -> bool:
+    return (
+        _HAS_NATIVE_EXT
+        and weight_t is not None
+        and input.device.type == "mps"
+        and weight_t.device.type == "mps"
+        and input.dtype in (torch.float32, torch.float16)
+        and weight_t.dtype == torch.float32
+        and input.is_contiguous()
+        and weight_t.is_contiguous()
+    )
+
+
 def _can_use_cuda_vector(input: torch.Tensor, weight0_t: Optional[torch.Tensor], weight1_t: Optional[torch.Tensor]) -> bool:
     return (
-        _HAS_CUDA_EXT
+        _HAS_NATIVE_EXT
         and weight0_t is not None
         and weight1_t is not None
         and input.is_cuda
@@ -81,6 +150,121 @@ def _can_use_cuda_vector(input: torch.Tensor, weight0_t: Optional[torch.Tensor],
         and weight0_t.is_contiguous()
         and weight1_t.is_contiguous()
     )
+
+
+def _can_use_metal_vector(input: torch.Tensor, weight0_t: Optional[torch.Tensor], weight1_t: Optional[torch.Tensor]) -> bool:
+    return (
+        _HAS_NATIVE_EXT
+        and weight0_t is not None
+        and weight1_t is not None
+        and input.device.type == "mps"
+        and weight0_t.device.type == "mps"
+        and weight1_t.device.type == "mps"
+        and input.dtype == torch.complex64
+        and weight0_t.dtype == torch.float32
+        and weight1_t.dtype == torch.float32
+        and input.is_contiguous()
+        and weight0_t.is_contiguous()
+        and weight1_t.is_contiguous()
+    )
+
+
+def _can_use_native_real_legendre(input: torch.Tensor, weight_t: Optional[torch.Tensor]) -> bool:
+    return _can_use_cuda_real_legendre(input, weight_t) or _can_use_metal_real_legendre(input, weight_t)
+
+
+def _parse_nonnegative_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _mps_scalar_fallback_chunk_m(weight: Optional[torch.Tensor], inverse: bool) -> int:
+    if weight is None or weight.device.type != "mps":
+        return 0
+
+    specific_env = (
+        "HOLYSHT_MPS_SCALAR_INVERSE_EINSUM_M_CHUNK"
+        if inverse
+        else "HOLYSHT_MPS_SCALAR_FORWARD_EINSUM_M_CHUNK"
+    )
+    raw = os.environ.get(specific_env)
+    if raw is None:
+        raw = os.environ.get("HOLYSHT_MPS_SCALAR_EINSUM_M_CHUNK")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
+
+    # On unified-memory Apple GPUs, chunk the inverse fallback only when the
+    # spectral weight slab is large enough that the full einsum risks paging.
+    if not inverse:
+        return 0
+
+    threshold_mb = _parse_nonnegative_int_env(
+        "HOLYSHT_MPS_SCALAR_INVERSE_EINSUM_CHUNK_THRESHOLD_MB",
+        1024,
+    )
+    if threshold_mb == 0:
+        return 0
+
+    weight_bytes = weight.numel() * weight.element_size()
+    if weight_bytes < threshold_mb * 1024 * 1024:
+        return 0
+
+    return 64 if weight.size(0) >= 512 else 128
+
+
+def _weight_chunk_for_dtype(weight: torch.Tensor, m0: int, m1: int, dtype: torch.dtype) -> torch.Tensor:
+    chunk = weight[m0:m1]
+    return chunk if chunk.dtype == dtype else chunk.to(dtype)
+
+
+def _chunked_legendre_forward_fallback(
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    chunk_m: int,
+) -> torch.Tensor:
+    x = torch.view_as_real(input)
+    pieces = []
+    for m0 in range(0, input.size(-1), chunk_m):
+        m1 = min(input.size(-1), m0 + chunk_m)
+        pieces.append(
+            torch.einsum(
+                "...kmr,mlk->...lmr",
+                x[..., :, m0:m1, :],
+                _weight_chunk_for_dtype(weights, m0, m1, x.dtype),
+            ).contiguous()
+        )
+
+    out = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2).contiguous()
+    return torch.view_as_complex(out)
+
+
+def _chunked_legendre_inverse_fallback(
+    input: torch.Tensor,
+    pct: torch.Tensor,
+    chunk_m: int,
+) -> torch.Tensor:
+    x = torch.view_as_real(input)
+    pieces = []
+    for m0 in range(0, input.size(-1), chunk_m):
+        m1 = min(input.size(-1), m0 + chunk_m)
+        pieces.append(
+            torch.einsum(
+                "...lmr,mlk->...kmr",
+                x[..., :, m0:m1, :],
+                _weight_chunk_for_dtype(pct, m0, m1, x.dtype),
+            ).contiguous()
+        )
+
+    out = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2).contiguous()
+    return torch.view_as_complex(out)
 
 
 def _mul_i(x: torch.Tensor) -> torch.Tensor:
@@ -114,7 +298,7 @@ def _prepare_irfft_input(x: torch.Tensor, nlon: int, active_mmax: Optional[int] 
         out = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
         out[..., :x.size(-1)] = x
 
-    if _HAS_CUDA_EXT and out.is_cuda and out.dtype == torch.complex64:
+    if _HAS_NATIVE_EXT and (out.is_cuda or out.device.type == "mps") and out.dtype == torch.complex64:
         orig_shape = out.shape
         flat = out.reshape(-1, orig_shape[-2], orig_shape[-1]).contiguous()
         _ops.sht_prepare_irfft(flat, active_mmax, nlon)
@@ -273,18 +457,18 @@ def fused_legendre_forward(
     if weight_t is None:
         weight_t = weights.float().permute(1, 2, 0).contiguous()
 
-    if _can_use_cuda_legendre(input, weight_t):
-        # Adaptive CUDA kernel: small-grid direct path + large-grid tiled path.
+    if _can_use_native_complex_legendre(input, weight_t) and (
+        input.device.type != "mps" or _prefer_metal_scalar_kernel(weight_t)
+    ):
         return _FusedLegendreForwardFn.apply(input, weight_t)
     else:
-        # Fallback: stacked einsum (1.9x speedup over reference 2x einsum)
+        chunk_m = _mps_scalar_fallback_chunk_m(weights, inverse=False)
+        if 0 < chunk_m < input.size(-1):
+            return _chunked_legendre_forward_fallback(input, weights, chunk_m)
+
         x = torch.view_as_real(input)  # [B, nlat, mmax, 2]
-        x_stacked = torch.cat([x[..., 0], x[..., 1]], dim=0)  # [2B, nlat, mmax]
-        w = weights.to(x_stacked.dtype)
-        out_stacked = torch.einsum("bkm,mlk->blm", x_stacked, w)
-        out_re = out_stacked[:B]
-        out_im = out_stacked[B:]
-        return torch.complex(out_re, out_im)
+        out = torch.einsum("...kmr,mlk->...lmr", x, weights.to(x.dtype)).contiguous()
+        return torch.view_as_complex(out)
 
 
 def fused_legendre_inverse(
@@ -301,14 +485,18 @@ def fused_legendre_inverse(
     if pct_t is None:
         pct_t = pct.float().permute(1, 2, 0).contiguous()
 
-    if _can_use_cuda_legendre(input, pct_t):
+    if _can_use_native_complex_legendre(input, pct_t) and (
+        input.device.type != "mps" or _prefer_metal_scalar_kernel(pct_t)
+    ):
         return _FusedLegendreInverseFn.apply(input, pct_t)
     else:
+        chunk_m = _mps_scalar_fallback_chunk_m(pct, inverse=True)
+        if 0 < chunk_m < input.size(-1):
+            return _chunked_legendre_inverse_fallback(input, pct, chunk_m)
+
         x = torch.view_as_real(input)
-        x_stacked = torch.cat([x[..., 0], x[..., 1]], dim=0)
-        p = pct.to(x_stacked.dtype)
-        out_stacked = torch.einsum("blm,mlk->bkm", x_stacked, p)
-        return torch.complex(out_stacked[:B], out_stacked[B:])
+        out = torch.einsum("...lmr,mlk->...kmr", x, pct.to(x.dtype)).contiguous()
+        return torch.view_as_complex(out)
 
 
 def fused_legendre_forward_real(
@@ -316,10 +504,27 @@ def fused_legendre_forward_real(
     weight_t: torch.Tensor,    # [lmax, nlat, mmax] float32
 ) -> torch.Tensor:
     """Real-valued forward Legendre transform with float accumulation."""
-    if _can_use_cuda_real_legendre(input, weight_t):
+    if _can_use_native_real_legendre(input, weight_t):
         return _FusedLegendreForwardRealFn.apply(input, weight_t)
 
     return torch.einsum("bkm,lkm->blm", input.float(), weight_t)
+
+
+def fused_legendre_inverse_real(
+    input: torch.Tensor,       # [B, lmax, mmax] float32
+    weight_t: torch.Tensor,    # [lmax, nlat, mmax] float32
+) -> torch.Tensor:
+    """Real-valued inverse Legendre transform with float accumulation."""
+    if _can_use_native_real_legendre(input, weight_t):
+        grad_output = input.contiguous()
+        output = torch.empty(
+            grad_output.size(0), weight_t.size(1), grad_output.size(2),
+            device=grad_output.device, dtype=torch.float32
+        )
+        _ops.fused_legendre_inverse_real(output, grad_output, weight_t)
+        return output
+
+    return torch.einsum("blm,lkm->bkm", input.float(), weight_t)
 
 
 # ============================================================================
@@ -363,7 +568,7 @@ class RealSHT(nn.Module):
     """Optimised drop-in replacement for ``torch_harmonics.RealSHT``.
 
     Args:
-        dtype: Weight precision. ``"fp32"`` (default) or ``"bf16"``.
+        dtype: Weight precision. ``"fp32"`` (default), ``"bf16"`` (CUDA), or ``"fp16"`` (MPS).
     """
 
     def __init__(
@@ -396,7 +601,13 @@ class RealSHT(nn.Module):
         self.norm = norm
         self.csphase = csphase
         self._use_bf16 = (dtype == "bf16")
-        w_dtype = torch.bfloat16 if self._use_bf16 else torch.float32
+        self._use_fp16 = (dtype == "fp16")
+        if self._use_bf16:
+            w_dtype = torch.bfloat16
+        elif self._use_fp16:
+            w_dtype = torch.float16
+        else:
+            w_dtype = torch.float32
         self.register_buffer("weights", ref.weights.to(w_dtype))
         self.register_buffer("weight_t", ref.weights.float().permute(1, 2, 0).contiguous())
 
@@ -406,7 +617,7 @@ class RealSHT(nn.Module):
                 x_fft = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
                 x_fft = x_fft[..., :self.mmax]
                 xr = torch.view_as_real(x_fft)
-                if _HAS_CUDA_EXT and x.is_cuda and not x.requires_grad:
+                if _HAS_NATIVE_EXT and x.is_cuda and not x.requires_grad:
                     xr_bf16 = xr.bfloat16().contiguous()
                     out_re = fused_legendre_forward_real(xr_bf16[..., 0].contiguous(), self.weight_t)
                     out_im = fused_legendre_forward_real(xr_bf16[..., 1].contiguous(), self.weight_t)
@@ -414,6 +625,21 @@ class RealSHT(nn.Module):
 
                 B = x.size(0)
                 xs = torch.cat([xr[..., 0], xr[..., 1]], dim=0).bfloat16()
+                out = torch.einsum("bkm,mlk->blm", xs, self.weights).float()
+                return torch.complex(out[:B], out[B:])
+        if self._use_fp16:
+            with _nvtx_range("holysht.scalar_forward_fp16"):
+                x_fft = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
+                x_fft = x_fft[..., :self.mmax]
+                xr = torch.view_as_real(x_fft)
+                if _HAS_NATIVE_EXT and x.device.type == "mps" and not x.requires_grad:
+                    xr_fp16 = xr.half().contiguous()
+                    out_re = fused_legendre_forward_real(xr_fp16[..., 0].contiguous(), self.weight_t)
+                    out_im = fused_legendre_forward_real(xr_fp16[..., 1].contiguous(), self.weight_t)
+                    return torch.complex(out_re, out_im)
+
+                B = x.size(0)
+                xs = torch.cat([xr[..., 0], xr[..., 1]], dim=0).half()
                 out = torch.einsum("bkm,mlk->blm", xs, self.weights).float()
                 return torch.complex(out[:B], out[B:])
         return fused_sht_forward(x, self.weights, self.mmax, self.weight_t)
@@ -461,10 +687,10 @@ class RealVectorSHT(nn.Module):
     """Optimised drop-in replacement for ``torch_harmonics.RealVectorSHT``.
 
     Reduces eight reference einsums to two composed Legendre passes on the
-    default FP32 CUDA path.
+    default FP32 CUDA/MPS path.
 
     Args:
-        dtype: Weight precision. ``"fp32"`` (default) or ``"bf16"``.
+        dtype: Weight precision. ``"fp32"`` (default), ``"bf16"`` (CUDA), or ``"fp16"`` (MPS).
     """
 
     def __init__(
@@ -497,7 +723,13 @@ class RealVectorSHT(nn.Module):
         self.norm = norm
         self.csphase = csphase
         self._use_bf16 = (dtype == "bf16")
-        w_dtype = torch.bfloat16 if self._use_bf16 else torch.float32
+        self._use_fp16 = (dtype == "fp16")
+        if self._use_bf16:
+            w_dtype = torch.bfloat16
+        elif self._use_fp16:
+            w_dtype = torch.float16
+        else:
+            w_dtype = torch.float32
         self.register_buffer("w0", ref.weights[0].to(w_dtype))  # [mmax, lmax, nlat]
         self.register_buffer("w1", ref.weights[1].to(w_dtype))  # [mmax, lmax, nlat]
         self.register_buffer("w0_t", ref.weights[0].float().permute(1, 2, 0).contiguous())
@@ -511,7 +743,7 @@ class RealVectorSHT(nn.Module):
             mmax = self.mmax
             x = x[..., :mmax].contiguous()
 
-            if (not self._use_bf16) and _can_use_cuda_vector(x, self.w0_t, self.w1_t):
+            if (not self._use_bf16 and not self._use_fp16) and (_can_use_cuda_vector(x, self.w0_t, self.w1_t) or _can_use_metal_vector(x, self.w0_t, self.w1_t)):
                 B_shape = x.shape[:-3]
                 x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
                 out = _FusedVectorLegendreForwardFn.apply(x_flat, self.w0_t, self.w1_t)
@@ -531,7 +763,15 @@ class RealVectorSHT(nn.Module):
             x11_flat = x11.reshape(-1, self.nlat, mmax)
             B = x00_flat.shape[0]
 
-            if self._use_bf16 and _HAS_CUDA_EXT and x00_flat.is_cuda and not x.requires_grad:
+            if self._use_fp16 and _HAS_NATIVE_EXT and x00_flat.device.type == "mps" and not x.requires_grad:
+                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).half().contiguous()
+                out_w0 = fused_legendre_forward_real(stacked_w0, self.w0_t)
+                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
+
+                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).half().contiguous()
+                out_w1 = fused_legendre_forward_real(stacked_w1, self.w1_t)
+                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
+            elif self._use_bf16 and _HAS_NATIVE_EXT and x00_flat.is_cuda and not x.requires_grad:
                 stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).bfloat16().contiguous()
                 out_w0 = fused_legendre_forward_real(stacked_w0, self.w0_t)
                 r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
@@ -539,20 +779,33 @@ class RealVectorSHT(nn.Module):
                 stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).bfloat16().contiguous()
                 out_w1 = fused_legendre_forward_real(stacked_w1, self.w1_t)
                 s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
+            elif (not self._use_bf16 and not self._use_fp16) and _can_use_native_real_legendre(x00_flat, self.w0_t):
+                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).contiguous()
+                out_w0 = fused_legendre_forward_real(stacked_w0, self.w0_t)
+                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
+
+                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).contiguous()
+                out_w1 = fused_legendre_forward_real(stacked_w1, self.w1_t)
+                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
             else:
+                _low_prec = self._use_bf16 or self._use_fp16
                 stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0)
                 if self._use_bf16:
                     stacked_w0 = stacked_w0.bfloat16()
+                elif self._use_fp16:
+                    stacked_w0 = stacked_w0.half()
                 out_w0 = torch.einsum("bkm,mlk->blm", stacked_w0, self.w0)
-                if self._use_bf16:
+                if _low_prec:
                     out_w0 = out_w0.float()
                 r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
 
                 stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0)
                 if self._use_bf16:
                     stacked_w1 = stacked_w1.bfloat16()
+                elif self._use_fp16:
+                    stacked_w1 = stacked_w1.half()
                 out_w1 = torch.einsum("bkm,mlk->blm", stacked_w1, self.w1)
-                if self._use_bf16:
+                if _low_prec:
                     out_w1 = out_w1.float()
                 s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
 
@@ -562,7 +815,7 @@ class RealVectorSHT(nn.Module):
             tor_im = s00 - r11
 
             out_shape = list(B_shape) + [2, self.lmax, mmax, 2]
-            xout = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
+            xout = torch.empty(out_shape, dtype=x.dtype, device=x.device)
             xout[..., 0, :, :, 0] = sph_re.reshape(B_shape + (self.lmax, mmax))
             xout[..., 0, :, :, 1] = sph_im.reshape(B_shape + (self.lmax, mmax))
             xout[..., 1, :, :, 0] = tor_re.reshape(B_shape + (self.lmax, mmax))
@@ -611,7 +864,7 @@ class InverseRealVectorSHT(nn.Module):
 
         with _nvtx_range("holysht.vector_inverse"):
             x = x.contiguous()
-            if _can_use_cuda_vector(x, self.d0_t, self.d1_t):
+            if _can_use_cuda_vector(x, self.d0_t, self.d1_t) or _can_use_metal_vector(x, self.d0_t, self.d1_t):
                 B_shape = x.shape[:-3]
                 x_flat = x.reshape(-1, 2, self.lmax, self.mmax).contiguous()
                 x_out = _FusedVectorLegendreInverseFn.apply(x_flat, self.d0_t, self.d1_t)
@@ -634,13 +887,22 @@ class InverseRealVectorSHT(nn.Module):
             x11_flat = x11.reshape(-1, self.lmax, mmax)
             B = x00_flat.shape[0]
 
-            stacked_d0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0)
-            out_d0 = torch.einsum("blm,mlk->bkm", stacked_d0, self.d0)
-            r00, r01, r10, r11 = out_d0[:B], out_d0[B:2 * B], out_d0[2 * B:3 * B], out_d0[3 * B:]
+            if _can_use_native_real_legendre(x00_flat, self.d0_t) and _prefer_metal_vector_inverse_kernel(x00_flat, self.d0_t):
+                stacked_d0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).contiguous()
+                out_d0 = fused_legendre_inverse_real(stacked_d0, self.d0_t)
+                r00, r01, r10, r11 = out_d0[:B], out_d0[B:2 * B], out_d0[2 * B:3 * B], out_d0[3 * B:]
 
-            stacked_d1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0)
-            out_d1 = torch.einsum("blm,mlk->bkm", stacked_d1, self.d1)
-            s11, s10, s01, s00 = out_d1[:B], out_d1[B:2 * B], out_d1[2 * B:3 * B], out_d1[3 * B:]
+                stacked_d1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).contiguous()
+                out_d1 = fused_legendre_inverse_real(stacked_d1, self.d1_t)
+                s11, s10, s01, s00 = out_d1[:B], out_d1[B:2 * B], out_d1[2 * B:3 * B], out_d1[3 * B:]
+            else:
+                stacked_d0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0)
+                out_d0 = torch.einsum("blm,mlk->bkm", stacked_d0, self.d0)
+                r00, r01, r10, r11 = out_d0[:B], out_d0[B:2 * B], out_d0[2 * B:3 * B], out_d0[3 * B:]
+
+                stacked_d1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0)
+                out_d1 = torch.einsum("blm,mlk->bkm", stacked_d1, self.d1)
+                s11, s10, s01, s00 = out_d1[:B], out_d1[B:2 * B], out_d1[2 * B:3 * B], out_d1[3 * B:]
 
             srl = r00 - s11
             sim = r01 + s10
@@ -648,14 +910,12 @@ class InverseRealVectorSHT(nn.Module):
             tim = s00 - r11
 
             out_k = self.nlat
-            srl = srl.reshape(B_shape + (out_k, mmax))
-            sim = sim.reshape(B_shape + (out_k, mmax))
-            trl = trl.reshape(B_shape + (out_k, mmax))
-            tim = tim.reshape(B_shape + (out_k, mmax))
-
-            s = torch.stack((srl, sim), -1)
-            t = torch.stack((trl, tim), -1)
-            xs = torch.stack((s, t), -4)
+            out_shape = B_shape + (2, out_k, mmax, 2)
+            xs = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+            xs[..., 0, :, :, 0] = srl.reshape(B_shape + (out_k, mmax))
+            xs[..., 0, :, :, 1] = sim.reshape(B_shape + (out_k, mmax))
+            xs[..., 1, :, :, 0] = trl.reshape(B_shape + (out_k, mmax))
+            xs[..., 1, :, :, 1] = tim.reshape(B_shape + (out_k, mmax))
             x_out = torch.view_as_complex(xs)
             x_out = _prepare_irfft_input(x_out, self.nlon, self.mmax)
             return torch.fft.irfft(x_out, n=self.nlon, dim=-1, norm="forward")
