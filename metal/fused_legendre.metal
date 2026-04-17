@@ -26,7 +26,7 @@ struct PrepareIrfftParams {
 
 constant uint LEGENDRE_TILE_M  = 32;
 constant uint LEGENDRE_TILE_Y  = 16;  // raised from 8 for better occupancy
-constant uint LEGENDRE_TILE_K  = 8;
+constant uint LEGENDRE_TILE_K  = 16;  // raised from 8 — matches TILE_Y for full thread utilization
 
 // ============================================================================
 // Direct (non-tiled) scalar kernels — float32
@@ -237,16 +237,15 @@ kernel void fused_legendre_forward_real_float_tiled(
     const bool tile_is_full_triangle = tile_l0 >= tile_m1;
     const bool active_triangle = active_output && (tile_is_full_triangle || (m <= l));
 
-    threadgroup float input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
+    threadgroup float input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
     float acc = 0.0f;
 
     for (uint k0 = 0; k0 < params.nlat; k0 += LEGENDRE_TILE_K) {
-        if (tid.y < LEGENDRE_TILE_K && m < params.mmax) {
-            const uint k_load = k0 + tid.y;
-            input_tile[tid.y][tid.x] = (b < params.batch_size && k_load < params.nlat)
-                ? input[((b * params.nlat + k_load) * params.mmax) + m]
-                : 0.0f;
-        }
+        // All TILE_Y threads participate in loading (TILE_K == TILE_Y)
+        const uint k_load = k0 + tid.y;
+        input_tile[tid.y][tid.x] = (m < params.mmax && b < params.batch_size && k_load < params.nlat)
+            ? input[((b * params.nlat + k_load) * params.mmax) + m]
+            : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (active_triangle) {
@@ -277,16 +276,15 @@ kernel void fused_legendre_inverse_real_float_tiled(
     const uint tile_m0 = tgid.x * LEGENDRE_TILE_M;
     const bool active_output = b < params.batch_size && k < params.nlat && m < params.mmax;
 
-    threadgroup float input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
+    threadgroup float input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
     float acc = 0.0f;
 
     for (uint l0 = tile_m0; l0 < params.lmax; l0 += LEGENDRE_TILE_K) {
+        // All TILE_Y threads participate in loading (TILE_K == TILE_Y)
         const uint l_load = l0 + tid.y;
-        if (tid.y < LEGENDRE_TILE_K && m < params.mmax) {
-            input_tile[tid.y][tid.x] = (b < params.batch_size && l_load < params.lmax)
-                ? input[((b * params.lmax + l_load) * params.mmax) + m]
-                : 0.0f;
-        }
+        input_tile[tid.y][tid.x] = (m < params.mmax && b < params.batch_size && l_load < params.lmax)
+            ? input[((b * params.lmax + l_load) * params.mmax) + m]
+            : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (active_output) {
@@ -333,16 +331,15 @@ kernel void fused_legendre_forward_complex_float_tiled(
     const bool tile_is_full_triangle = tile_l0 >= tile_m1;
     const bool active_triangle = active_output && (tile_is_full_triangle || (m <= l));
 
-    threadgroup float2 input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
+    threadgroup float2 input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
     float2 acc = float2(0.0f, 0.0f);
 
     for (uint k0 = 0; k0 < params.nlat; k0 += LEGENDRE_TILE_K) {
-        if (tid.y < LEGENDRE_TILE_K && m < params.mmax) {
-            const uint k_load = k0 + tid.y;
-            input_tile[tid.y][tid.x] = (b < params.batch_size && k_load < params.nlat)
-                ? input[((b * params.nlat + k_load) * params.mmax) + m]
-                : float2(0.0f, 0.0f);
-        }
+        // All TILE_Y threads participate in loading (TILE_K == TILE_Y)
+        const uint k_load = k0 + tid.y;
+        input_tile[tid.y][tid.x] = (m < params.mmax && b < params.batch_size && k_load < params.nlat)
+            ? input[((b * params.nlat + k_load) * params.mmax) + m]
+            : float2(0.0f, 0.0f);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (active_triangle) {
@@ -376,16 +373,15 @@ kernel void fused_legendre_inverse_complex_float_tiled(
     const uint tile_m0 = tgid.x * LEGENDRE_TILE_M;
     const bool active_output = b < params.batch_size && k < params.nlat && m < params.mmax;
 
-    threadgroup float2 input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
+    threadgroup float2 input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
     float2 acc = float2(0.0f, 0.0f);
 
     for (uint l0 = tile_m0; l0 < params.lmax; l0 += LEGENDRE_TILE_K) {
-        if (tid.y < LEGENDRE_TILE_K && m < params.mmax) {
-            const uint l_load = l0 + tid.y;
-            input_tile[tid.y][tid.x] = (b < params.batch_size && l_load < params.lmax)
-                ? input[((b * params.lmax + l_load) * params.mmax) + m]
-                : float2(0.0f, 0.0f);
-        }
+        // All TILE_Y threads participate in loading (TILE_K == TILE_Y)
+        const uint l_load = l0 + tid.y;
+        input_tile[tid.y][tid.x] = (m < params.mmax && b < params.batch_size && l_load < params.lmax)
+            ? input[((b * params.lmax + l_load) * params.mmax) + m]
+            : float2(0.0f, 0.0f);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (active_output) {
@@ -439,16 +435,15 @@ kernel void fused_legendre_forward_real_half_tiled(
     const bool active_triangle = active_output && (tile_is_full_triangle || (m <= l));
 
     // Use float tile for promoted input values
-    threadgroup float input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
+    threadgroup float input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
     float acc = 0.0f;
 
     for (uint k0 = 0; k0 < params.nlat; k0 += LEGENDRE_TILE_K) {
-        if (tid.y < LEGENDRE_TILE_K && m < params.mmax) {
-            const uint k_load = k0 + tid.y;
-            input_tile[tid.y][tid.x] = (b < params.batch_size && k_load < params.nlat)
-                ? float(input[((b * params.nlat + k_load) * params.mmax) + m])
-                : 0.0f;
-        }
+        // All TILE_Y threads participate in loading (TILE_K == TILE_Y)
+        const uint k_load = k0 + tid.y;
+        input_tile[tid.y][tid.x] = (m < params.mmax && b < params.batch_size && k_load < params.nlat)
+            ? float(input[((b * params.nlat + k_load) * params.mmax) + m])
+            : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (active_triangle) {
@@ -479,16 +474,15 @@ kernel void fused_legendre_inverse_real_half_tiled(
     const uint tile_m0 = tgid.x * LEGENDRE_TILE_M;
     const bool active_output = b < params.batch_size && k < params.nlat && m < params.mmax;
 
-    threadgroup float input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
+    threadgroup float input_tile[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
     float acc = 0.0f;
 
     for (uint l0 = tile_m0; l0 < params.lmax; l0 += LEGENDRE_TILE_K) {
-        if (tid.y < LEGENDRE_TILE_K && m < params.mmax) {
-            const uint l_load = l0 + tid.y;
-            input_tile[tid.y][tid.x] = (b < params.batch_size && l_load < params.lmax)
-                ? float(input[((b * params.lmax + l_load) * params.mmax) + m])
-                : 0.0f;
-        }
+        // All TILE_Y threads participate in loading (TILE_K == TILE_Y)
+        const uint l_load = l0 + tid.y;
+        input_tile[tid.y][tid.x] = (m < params.mmax && b < params.batch_size && l_load < params.lmax)
+            ? float(input[((b * params.lmax + l_load) * params.mmax) + m])
+            : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (active_output) {
@@ -643,8 +637,8 @@ kernel void fused_vector_legendre_forward_complex_float_tiled(
     const bool active = valid_out && (tile_is_full_triangle || (m <= l));
     const bool can_load = b < params.batch_size && m < params.mmax;
 
-    threadgroup float2 sm_comp0[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
-    threadgroup float2 sm_comp1[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
+    threadgroup float2 sm_comp0[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
+    threadgroup float2 sm_comp1[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
 
     float sph_re = 0.0f, sph_im = 0.0f;
     float tor_re = 0.0f, tor_im = 0.0f;
@@ -653,15 +647,14 @@ kernel void fused_vector_legendre_forward_complex_float_tiled(
     const uint w_base = l * params.nlat * params.mmax + m;
 
     for (uint k0 = 0; k0 < params.nlat; k0 += LEGENDRE_TILE_K) {
-        if (tid.y < LEGENDRE_TILE_K && can_load) {
-            const uint k_load = k0 + tid.y;
-            if (k_load < params.nlat) {
-                sm_comp0[tid.y][tid.x] = input[in_base + k_load * params.mmax + m];
-                sm_comp1[tid.y][tid.x] = input[in_base + params.nlat * params.mmax + k_load * params.mmax + m];
-            } else {
-                sm_comp0[tid.y][tid.x] = float2(0.0f, 0.0f);
-                sm_comp1[tid.y][tid.x] = float2(0.0f, 0.0f);
-            }
+        // All TILE_Y threads participate in loading (TILE_K == TILE_Y)
+        const uint k_load = k0 + tid.y;
+        if (can_load && k_load < params.nlat) {
+            sm_comp0[tid.y][tid.x] = input[in_base + k_load * params.mmax + m];
+            sm_comp1[tid.y][tid.x] = input[in_base + params.nlat * params.mmax + k_load * params.mmax + m];
+        } else {
+            sm_comp0[tid.y][tid.x] = float2(0.0f, 0.0f);
+            sm_comp1[tid.y][tid.x] = float2(0.0f, 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -712,8 +705,8 @@ kernel void fused_vector_legendre_inverse_complex_float_tiled(
     const bool valid_out = b < params.batch_size && k < params.nlat && m < params.mmax;
     const bool can_load = b < params.batch_size && m < params.mmax;
 
-    threadgroup float2 sm_sph[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
-    threadgroup float2 sm_tor[LEGENDRE_TILE_K][LEGENDRE_TILE_M];
+    threadgroup float2 sm_sph[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
+    threadgroup float2 sm_tor[LEGENDRE_TILE_K][LEGENDRE_TILE_M + 1];
 
     float comp0_re = 0.0f, comp0_im = 0.0f;
     float comp1_re = 0.0f, comp1_im = 0.0f;
@@ -721,15 +714,14 @@ kernel void fused_vector_legendre_inverse_complex_float_tiled(
     const uint in_base = b * 2 * params.lmax * params.mmax;
 
     for (uint l0 = tile_m0; l0 < params.lmax; l0 += LEGENDRE_TILE_K) {
-        if (tid.y < LEGENDRE_TILE_K && can_load) {
-            const uint l_load = l0 + tid.y;
-            if (l_load < params.lmax) {
-                sm_sph[tid.y][tid.x] = input[in_base + l_load * params.mmax + m];
-                sm_tor[tid.y][tid.x] = input[in_base + params.lmax * params.mmax + l_load * params.mmax + m];
-            } else {
-                sm_sph[tid.y][tid.x] = float2(0.0f, 0.0f);
-                sm_tor[tid.y][tid.x] = float2(0.0f, 0.0f);
-            }
+        // All TILE_Y threads participate in loading (TILE_K == TILE_Y)
+        const uint l_load = l0 + tid.y;
+        if (can_load && l_load < params.lmax) {
+            sm_sph[tid.y][tid.x] = input[in_base + l_load * params.mmax + m];
+            sm_tor[tid.y][tid.x] = input[in_base + params.lmax * params.mmax + l_load * params.mmax + m];
+        } else {
+            sm_sph[tid.y][tid.x] = float2(0.0f, 0.0f);
+            sm_tor[tid.y][tid.x] = float2(0.0f, 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

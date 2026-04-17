@@ -14,6 +14,7 @@
 namespace {
 
 constexpr int TILE_M = 32;
+constexpr int TILE_K = 16;  // reduction tile size (decoupled from TILE_L)
 
 struct LaunchConfig {
     int tile_l;
@@ -124,43 +125,61 @@ __global__ void fused_legendre_forward_large_kernel(
     const bool active = valid_out && (m <= l);
     const bool can_load = (b < batch_size) && (m < mmax);
 
-    __shared__ float2 sm_input[TILE_L][TILE_M + 1];
+    __shared__ float2 sm_input[TILE_K][TILE_M + 1];
 
     float acc_re = 0.0f;
     float acc_im = 0.0f;
     const long long in_base = (long long)b * nlat * mmax + m;
     const long long w_base = (long long)l * nlat * mmax + m;
 
-    const int k_load = threadIdx.y;
-    if (can_load && k_load < nlat) {
-        sm_input[threadIdx.y][threadIdx.x] = load_complex(&input[in_base + (long long)k_load * mmax]);
-    } else {
-        sm_input[threadIdx.y][threadIdx.x] = make_float2(0.0f, 0.0f);
+    // Load first tile cooperatively: all threads load TILE_K / TILE_L rows each
+    #pragma unroll
+    for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+        const int row = pass * TILE_L + threadIdx.y;
+        const int k_global = row;
+        if (can_load && k_global < nlat) {
+            sm_input[row][threadIdx.x] = load_complex(&input[in_base + (long long)k_global * mmax]);
+        } else {
+            sm_input[row][threadIdx.x] = make_float2(0.0f, 0.0f);
+        }
     }
     __syncthreads();
 
-    for (int k0 = 0; k0 < nlat; k0 += TILE_L) {
-        float2 prefetch = make_float2(0.0f, 0.0f);
-        const int next_k = k0 + TILE_L + threadIdx.y;
-        if (can_load && next_k < nlat) {
-            prefetch = load_complex(&input[in_base + (long long)next_k * mmax]);
+    for (int k0 = 0; k0 < nlat; k0 += TILE_K) {
+        // Prefetch next tile into registers
+        float2 prefetch[TILE_K / TILE_L];
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            const int next_k = k0 + TILE_K + row;
+            prefetch[pass] = (can_load && next_k < nlat)
+                ? load_complex(&input[in_base + (long long)next_k * mmax])
+                : make_float2(0.0f, 0.0f);
         }
 
+        // Pre-load weights into registers, then compute from shmem + registers
         if (active) {
+            float w_reg[TILE_K];
             #pragma unroll
-            for (int kk = 0; kk < TILE_L; ++kk) {
+            for (int kk = 0; kk < TILE_K; ++kk) {
                 const int k_idx = k0 + kk;
-                if (k_idx < nlat) {
-                    const float w = __ldg(&weight_t[w_base + (long long)k_idx * mmax]);
-                    const float2 v = sm_input[kk][threadIdx.x];
-                    acc_re = fmaf(w, v.x, acc_re);
-                    acc_im = fmaf(w, v.y, acc_im);
-                }
+                w_reg[kk] = (k_idx < nlat) ? __ldg(&weight_t[w_base + (long long)k_idx * mmax]) : 0.0f;
+            }
+            #pragma unroll
+            for (int kk = 0; kk < TILE_K; ++kk) {
+                const float2 v = sm_input[kk][threadIdx.x];
+                acc_re = fmaf(w_reg[kk], v.x, acc_re);
+                acc_im = fmaf(w_reg[kk], v.y, acc_im);
             }
         }
 
+        // Store prefetched data to shared memory
         __syncthreads();
-        sm_input[threadIdx.y][threadIdx.x] = prefetch;
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            sm_input[row][threadIdx.x] = prefetch[pass];
+        }
         __syncthreads();
     }
 
@@ -224,42 +243,62 @@ __global__ void fused_legendre_inverse_large_kernel(
     const bool valid_out = (b < batch_size) && (k < nlat) && (m < mmax);
     const bool can_load = (b < batch_size) && (m < mmax);
 
-    __shared__ float2 sm_input[TILE_L][TILE_M + 1];
+    __shared__ float2 sm_input[TILE_K][TILE_M + 1];
 
     float acc_re = 0.0f;
     float acc_im = 0.0f;
     const long long in_base = (long long)b * lmax * mmax + m;
+    const long long w_offset = (long long)k * mmax + m;
 
-    const int l_load = threadIdx.y;
-    if (can_load && l_load < lmax) {
-        sm_input[threadIdx.y][threadIdx.x] = load_complex(&input[in_base + (long long)l_load * mmax]);
-    } else {
-        sm_input[threadIdx.y][threadIdx.x] = make_float2(0.0f, 0.0f);
+    // Load first tile cooperatively
+    #pragma unroll
+    for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+        const int row = pass * TILE_L + threadIdx.y;
+        if (can_load && row < lmax) {
+            sm_input[row][threadIdx.x] = load_complex(&input[in_base + (long long)row * mmax]);
+        } else {
+            sm_input[row][threadIdx.x] = make_float2(0.0f, 0.0f);
+        }
     }
     __syncthreads();
 
-    for (int l0 = 0; l0 < lmax; l0 += TILE_L) {
-        float2 prefetch = make_float2(0.0f, 0.0f);
-        const int next_l = l0 + TILE_L + threadIdx.y;
-        if (can_load && next_l < lmax) {
-            prefetch = load_complex(&input[in_base + (long long)next_l * mmax]);
+    for (int l0 = 0; l0 < lmax; l0 += TILE_K) {
+        // Prefetch next tile into registers
+        float2 prefetch[TILE_K / TILE_L];
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            const int next_l = l0 + TILE_K + row;
+            prefetch[pass] = (can_load && next_l < lmax)
+                ? load_complex(&input[in_base + (long long)next_l * mmax])
+                : make_float2(0.0f, 0.0f);
         }
 
+        // Pre-load weights into registers, then compute from shmem + registers
         if (valid_out) {
+            float w_reg[TILE_K];
             #pragma unroll
-            for (int ll = 0; ll < TILE_L; ++ll) {
+            for (int ll = 0; ll < TILE_K; ++ll) {
                 const int l_idx = l0 + ll;
-                if ((l_idx < lmax) && (l_idx >= m)) {
-                    const float w = __ldg(&weight_t[(long long)l_idx * nlat * mmax + (long long)k * mmax + m]);
-                    const float2 v = sm_input[ll][threadIdx.x];
-                    acc_re = fmaf(w, v.x, acc_re);
-                    acc_im = fmaf(w, v.y, acc_im);
-                }
+                w_reg[ll] = (l_idx < lmax && l_idx >= m)
+                    ? __ldg(&weight_t[(long long)l_idx * nlat * mmax + w_offset])
+                    : 0.0f;
+            }
+            #pragma unroll
+            for (int ll = 0; ll < TILE_K; ++ll) {
+                const float2 v = sm_input[ll][threadIdx.x];
+                acc_re = fmaf(w_reg[ll], v.x, acc_re);
+                acc_im = fmaf(w_reg[ll], v.y, acc_im);
             }
         }
 
+        // Store prefetched data to shared memory
         __syncthreads();
-        sm_input[threadIdx.y][threadIdx.x] = prefetch;
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            sm_input[row][threadIdx.x] = prefetch[pass];
+        }
         __syncthreads();
     }
 
@@ -327,40 +366,57 @@ __global__ void fused_legendre_forward_real_large_kernel(
     const bool active = valid_out && (m <= l);
     const bool can_load = (b < batch_size) && (m < mmax);
 
-    __shared__ float sm_input[TILE_L][TILE_M + 1];
+    __shared__ float sm_input[TILE_K][TILE_M + 1];
 
     float acc = 0.0f;
     const long long in_base = (long long)b * nlat * mmax + m;
     const long long w_base = (long long)l * nlat * mmax + m;
 
-    const int k_load = threadIdx.y;
-    if (can_load && k_load < nlat) {
-        sm_input[threadIdx.y][threadIdx.x] = load_scalar(&input[in_base + (long long)k_load * mmax]);
-    } else {
-        sm_input[threadIdx.y][threadIdx.x] = 0.0f;
+    // Load first tile cooperatively
+    #pragma unroll
+    for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+        const int row = pass * TILE_L + threadIdx.y;
+        if (can_load && row < nlat) {
+            sm_input[row][threadIdx.x] = load_scalar(&input[in_base + (long long)row * mmax]);
+        } else {
+            sm_input[row][threadIdx.x] = 0.0f;
+        }
     }
     __syncthreads();
 
-    for (int k0 = 0; k0 < nlat; k0 += TILE_L) {
-        float prefetch = 0.0f;
-        const int next_k = k0 + TILE_L + threadIdx.y;
-        if (can_load && next_k < nlat) {
-            prefetch = load_scalar(&input[in_base + (long long)next_k * mmax]);
+    for (int k0 = 0; k0 < nlat; k0 += TILE_K) {
+        // Prefetch next tile into registers
+        float prefetch[TILE_K / TILE_L];
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            const int next_k = k0 + TILE_K + row;
+            prefetch[pass] = (can_load && next_k < nlat)
+                ? load_scalar(&input[in_base + (long long)next_k * mmax])
+                : 0.0f;
         }
 
+        // Pre-load weights into registers, then compute from shmem + registers
         if (active) {
+            float w_reg[TILE_K];
             #pragma unroll
-            for (int kk = 0; kk < TILE_L; ++kk) {
+            for (int kk = 0; kk < TILE_K; ++kk) {
                 const int k_idx = k0 + kk;
-                if (k_idx < nlat) {
-                    const float w = __ldg(&weight_t[w_base + (long long)k_idx * mmax]);
-                    acc = fmaf(w, sm_input[kk][threadIdx.x], acc);
-                }
+                w_reg[kk] = (k_idx < nlat) ? __ldg(&weight_t[w_base + (long long)k_idx * mmax]) : 0.0f;
+            }
+            #pragma unroll
+            for (int kk = 0; kk < TILE_K; ++kk) {
+                acc = fmaf(w_reg[kk], sm_input[kk][threadIdx.x], acc);
             }
         }
 
+        // Store prefetched data to shared memory
         __syncthreads();
-        sm_input[threadIdx.y][threadIdx.x] = prefetch;
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            sm_input[row][threadIdx.x] = prefetch[pass];
+        }
         __syncthreads();
     }
 
@@ -422,39 +478,59 @@ __global__ void fused_legendre_inverse_real_large_kernel(
     const bool valid_out = (b < batch_size) && (k < nlat) && (m < mmax);
     const bool can_load = (b < batch_size) && (m < mmax);
 
-    __shared__ float sm_input[TILE_L][TILE_M + 1];
+    __shared__ float sm_input[TILE_K][TILE_M + 1];
 
     float acc = 0.0f;
     const long long in_base = (long long)b * lmax * mmax + m;
+    const long long w_offset = (long long)k * mmax + m;
 
-    const int l_load = threadIdx.y;
-    if (can_load && l_load < lmax) {
-        sm_input[threadIdx.y][threadIdx.x] = load_scalar(&input[in_base + (long long)l_load * mmax]);
-    } else {
-        sm_input[threadIdx.y][threadIdx.x] = 0.0f;
+    // Load first tile cooperatively
+    #pragma unroll
+    for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+        const int row = pass * TILE_L + threadIdx.y;
+        if (can_load && row < lmax) {
+            sm_input[row][threadIdx.x] = load_scalar(&input[in_base + (long long)row * mmax]);
+        } else {
+            sm_input[row][threadIdx.x] = 0.0f;
+        }
     }
     __syncthreads();
 
-    for (int l0 = 0; l0 < lmax; l0 += TILE_L) {
-        float prefetch = 0.0f;
-        const int next_l = l0 + TILE_L + threadIdx.y;
-        if (can_load && next_l < lmax) {
-            prefetch = load_scalar(&input[in_base + (long long)next_l * mmax]);
+    for (int l0 = 0; l0 < lmax; l0 += TILE_K) {
+        // Prefetch next tile into registers
+        float prefetch[TILE_K / TILE_L];
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            const int next_l = l0 + TILE_K + row;
+            prefetch[pass] = (can_load && next_l < lmax)
+                ? load_scalar(&input[in_base + (long long)next_l * mmax])
+                : 0.0f;
         }
 
+        // Pre-load weights into registers, then compute from shmem + registers
         if (valid_out) {
+            float w_reg[TILE_K];
             #pragma unroll
-            for (int ll = 0; ll < TILE_L; ++ll) {
+            for (int ll = 0; ll < TILE_K; ++ll) {
                 const int l_idx = l0 + ll;
-                if ((l_idx < lmax) && (l_idx >= m)) {
-                    const float w = __ldg(&weight_t[(long long)l_idx * nlat * mmax + (long long)k * mmax + m]);
-                    acc = fmaf(w, sm_input[ll][threadIdx.x], acc);
-                }
+                w_reg[ll] = (l_idx < lmax && l_idx >= m)
+                    ? __ldg(&weight_t[(long long)l_idx * nlat * mmax + w_offset])
+                    : 0.0f;
+            }
+            #pragma unroll
+            for (int ll = 0; ll < TILE_K; ++ll) {
+                acc = fmaf(w_reg[ll], sm_input[ll][threadIdx.x], acc);
             }
         }
 
+        // Store prefetched data to shared memory
         __syncthreads();
-        sm_input[threadIdx.y][threadIdx.x] = prefetch;
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            sm_input[row][threadIdx.x] = prefetch[pass];
+        }
         __syncthreads();
     }
 
@@ -544,8 +620,8 @@ __global__ void fused_vector_legendre_forward_large_kernel(
     const bool active = valid_out && (m <= l);
     const bool can_load = (b < batch_size) && (m < mmax);
 
-    __shared__ float2 sm_comp0[TILE_L][TILE_M + 1];
-    __shared__ float2 sm_comp1[TILE_L][TILE_M + 1];
+    __shared__ float2 sm_comp0[TILE_K][TILE_M + 1];
+    __shared__ float2 sm_comp1[TILE_K][TILE_M + 1];
 
     float sph_re = 0.0f;
     float sph_im = 0.0f;
@@ -555,28 +631,41 @@ __global__ void fused_vector_legendre_forward_large_kernel(
     const long long in_base = (long long)b * 2 * nlat * mmax;
     const long long w_base = (long long)l * nlat * mmax + m;
 
-    const int k_load = threadIdx.y;
-    if (can_load && k_load < nlat) {
-        sm_comp0[threadIdx.y][threadIdx.x] = load_complex(&input[in_base + (long long)k_load * mmax + m]);
-        sm_comp1[threadIdx.y][threadIdx.x] = load_complex(&input[in_base + (long long)nlat * mmax + (long long)k_load * mmax + m]);
-    } else {
-        sm_comp0[threadIdx.y][threadIdx.x] = make_float2(0.0f, 0.0f);
-        sm_comp1[threadIdx.y][threadIdx.x] = make_float2(0.0f, 0.0f);
+    // Load first tile cooperatively
+    #pragma unroll
+    for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+        const int row = pass * TILE_L + threadIdx.y;
+        if (can_load && row < nlat) {
+            sm_comp0[row][threadIdx.x] = load_complex(&input[in_base + (long long)row * mmax + m]);
+            sm_comp1[row][threadIdx.x] = load_complex(&input[in_base + (long long)nlat * mmax + (long long)row * mmax + m]);
+        } else {
+            sm_comp0[row][threadIdx.x] = make_float2(0.0f, 0.0f);
+            sm_comp1[row][threadIdx.x] = make_float2(0.0f, 0.0f);
+        }
     }
     __syncthreads();
 
-    for (int k0 = 0; k0 < nlat; k0 += TILE_L) {
-        float2 prefetch0 = make_float2(0.0f, 0.0f);
-        float2 prefetch1 = make_float2(0.0f, 0.0f);
-        const int next_k = k0 + TILE_L + threadIdx.y;
-        if (can_load && next_k < nlat) {
-            prefetch0 = load_complex(&input[in_base + (long long)next_k * mmax + m]);
-            prefetch1 = load_complex(&input[in_base + (long long)nlat * mmax + (long long)next_k * mmax + m]);
+    for (int k0 = 0; k0 < nlat; k0 += TILE_K) {
+        // Prefetch next tile into registers
+        float2 prefetch0[TILE_K / TILE_L];
+        float2 prefetch1[TILE_K / TILE_L];
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            const int next_k = k0 + TILE_K + row;
+            if (can_load && next_k < nlat) {
+                prefetch0[pass] = load_complex(&input[in_base + (long long)next_k * mmax + m]);
+                prefetch1[pass] = load_complex(&input[in_base + (long long)nlat * mmax + (long long)next_k * mmax + m]);
+            } else {
+                prefetch0[pass] = make_float2(0.0f, 0.0f);
+                prefetch1[pass] = make_float2(0.0f, 0.0f);
+            }
         }
 
+        // Compute from shmem (no weight pre-loading for vector kernels — register pressure)
         if (active) {
             #pragma unroll
-            for (int kk = 0; kk < TILE_L; ++kk) {
+            for (int kk = 0; kk < TILE_K; ++kk) {
                 const int k_idx = k0 + kk;
                 if (k_idx < nlat) {
                     const float2 comp0 = sm_comp0[kk][threadIdx.x];
@@ -597,9 +686,14 @@ __global__ void fused_vector_legendre_forward_large_kernel(
             }
         }
 
+        // Store prefetched data to shared memory
         __syncthreads();
-        sm_comp0[threadIdx.y][threadIdx.x] = prefetch0;
-        sm_comp1[threadIdx.y][threadIdx.x] = prefetch1;
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            sm_comp0[row][threadIdx.x] = prefetch0[pass];
+            sm_comp1[row][threadIdx.x] = prefetch1[pass];
+        }
         __syncthreads();
     }
 
@@ -687,8 +781,8 @@ __global__ void fused_vector_legendre_inverse_large_kernel(
     const bool valid_out = (b < batch_size) && (k < nlat) && (m < mmax);
     const bool can_load = (b < batch_size) && (m < mmax);
 
-    __shared__ float2 sm_sph[TILE_L][TILE_M + 1];
-    __shared__ float2 sm_tor[TILE_L][TILE_M + 1];
+    __shared__ float2 sm_sph[TILE_K][TILE_M + 1];
+    __shared__ float2 sm_tor[TILE_K][TILE_M + 1];
 
     float comp0_re = 0.0f;
     float comp0_im = 0.0f;
@@ -696,35 +790,49 @@ __global__ void fused_vector_legendre_inverse_large_kernel(
     float comp1_im = 0.0f;
 
     const long long in_base = (long long)b * 2 * lmax * mmax;
+    const long long w_offset = (long long)k * mmax + m;
 
-    const int l_load = threadIdx.y;
-    if (can_load && l_load < lmax) {
-        sm_sph[threadIdx.y][threadIdx.x] = load_complex(&input[in_base + (long long)l_load * mmax + m]);
-        sm_tor[threadIdx.y][threadIdx.x] = load_complex(&input[in_base + (long long)lmax * mmax + (long long)l_load * mmax + m]);
-    } else {
-        sm_sph[threadIdx.y][threadIdx.x] = make_float2(0.0f, 0.0f);
-        sm_tor[threadIdx.y][threadIdx.x] = make_float2(0.0f, 0.0f);
+    // Load first tile cooperatively
+    #pragma unroll
+    for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+        const int row = pass * TILE_L + threadIdx.y;
+        if (can_load && row < lmax) {
+            sm_sph[row][threadIdx.x] = load_complex(&input[in_base + (long long)row * mmax + m]);
+            sm_tor[row][threadIdx.x] = load_complex(&input[in_base + (long long)lmax * mmax + (long long)row * mmax + m]);
+        } else {
+            sm_sph[row][threadIdx.x] = make_float2(0.0f, 0.0f);
+            sm_tor[row][threadIdx.x] = make_float2(0.0f, 0.0f);
+        }
     }
     __syncthreads();
 
-    for (int l0 = 0; l0 < lmax; l0 += TILE_L) {
-        float2 prefetch_sph = make_float2(0.0f, 0.0f);
-        float2 prefetch_tor = make_float2(0.0f, 0.0f);
-        const int next_l = l0 + TILE_L + threadIdx.y;
-        if (can_load && next_l < lmax) {
-            prefetch_sph = load_complex(&input[in_base + (long long)next_l * mmax + m]);
-            prefetch_tor = load_complex(&input[in_base + (long long)lmax * mmax + (long long)next_l * mmax + m]);
+    for (int l0 = 0; l0 < lmax; l0 += TILE_K) {
+        // Prefetch next tile into registers
+        float2 prefetch_sph[TILE_K / TILE_L];
+        float2 prefetch_tor[TILE_K / TILE_L];
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            const int next_l = l0 + TILE_K + row;
+            if (can_load && next_l < lmax) {
+                prefetch_sph[pass] = load_complex(&input[in_base + (long long)next_l * mmax + m]);
+                prefetch_tor[pass] = load_complex(&input[in_base + (long long)lmax * mmax + (long long)next_l * mmax + m]);
+            } else {
+                prefetch_sph[pass] = make_float2(0.0f, 0.0f);
+                prefetch_tor[pass] = make_float2(0.0f, 0.0f);
+            }
         }
 
+        // Compute from shmem (no weight pre-loading for vector kernels — register pressure)
         if (valid_out) {
             #pragma unroll
-            for (int ll = 0; ll < TILE_L; ++ll) {
+            for (int ll = 0; ll < TILE_K; ++ll) {
                 const int l_idx = l0 + ll;
                 if ((l_idx < lmax) && (l_idx >= m)) {
                     const float2 sph = sm_sph[ll][threadIdx.x];
                     const float2 tor = sm_tor[ll][threadIdx.x];
-                    const float w0 = __ldg(&weight0_t[(long long)l_idx * nlat * mmax + (long long)k * mmax + m]);
-                    const float w1 = __ldg(&weight1_t[(long long)l_idx * nlat * mmax + (long long)k * mmax + m]);
+                    const float w0 = __ldg(&weight0_t[(long long)l_idx * nlat * mmax + w_offset]);
+                    const float w1 = __ldg(&weight1_t[(long long)l_idx * nlat * mmax + w_offset]);
 
                     comp0_re = fmaf(w0, sph.x, comp0_re);
                     comp0_re = fmaf(-w1, tor.y, comp0_re);
@@ -739,9 +847,14 @@ __global__ void fused_vector_legendre_inverse_large_kernel(
             }
         }
 
+        // Store prefetched data to shared memory
         __syncthreads();
-        sm_sph[threadIdx.y][threadIdx.x] = prefetch_sph;
-        sm_tor[threadIdx.y][threadIdx.x] = prefetch_tor;
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            sm_sph[row][threadIdx.x] = prefetch_sph[pass];
+            sm_tor[row][threadIdx.x] = prefetch_tor[pass];
+        }
         __syncthreads();
     }
 
