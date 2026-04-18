@@ -89,6 +89,11 @@ inline LaunchConfig apply_backend_hint(LaunchConfig config, const ForwardBackend
             config.use_tma = at::cuda::getCurrentDeviceProperties()->major >= 9;
 #endif
             break;
+        case ForwardBackendHint::TcBf16:
+            // BF16 tensor-core forward is not implemented yet; keep it on the
+            // legacy non-TC path for now.
+            config.use_tma = false;
+            break;
         default:
             break;
     }
