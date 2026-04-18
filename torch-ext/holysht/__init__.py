@@ -24,13 +24,12 @@ __all__ = [
     "InverseRealSHT",
     "RealVectorSHT",
     "InverseRealVectorSHT",
+    "GraphedModule",
     "legendre_forward",
     "legendre_inverse",
     "sht_forward",
     "sht_inverse",
 ]
-
-_ROOT = Path(__file__).resolve().parent
 
 # Prefer kernel-builder's generated alias module on packaged builds, then fall
 # back to the local single-machine JIT loader for development.
@@ -188,6 +187,7 @@ def _parse_nonnegative_int_env(name: str, default: int) -> int:
     except ValueError:
         return default
 
+
 class _ForwardBackend(IntEnum):
     AUTO = 0
     FMA = 1
@@ -219,7 +219,9 @@ def _autotune_batch_bucket(batch_size: int) -> str:
 
 
 def _default_autotune_cache_path() -> Path:
-    return _ROOT / "build" / "holysht_autotune_cache.json"
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+    base_dir = Path(cache_home) if cache_home else (Path.home() / ".cache")
+    return base_dir / "holysht" / "holysht_autotune_cache.json"
 
 
 class _AutotuneCache:
@@ -231,9 +233,12 @@ class _AutotuneCache:
         if not self.path.exists():
             return {}
         try:
-            return json.loads(self.path.read_text())
+            payload = json.loads(self.path.read_text())
         except Exception:
             return {}
+        if not isinstance(payload, dict):
+            return {}
+        return payload
 
     def load(self, key: _AutotuneKey) -> Optional[str]:
         return self._read().get(json.dumps(asdict(key), sort_keys=True))
@@ -357,6 +362,99 @@ def _nvtx_range(name: str):
             torch.cuda.nvtx.range_pop()
     else:
         yield
+
+
+def _cuda_tma_requested() -> bool:
+    raw = os.environ.get("HOLYSHT_USE_TMA")
+    if raw is None or raw == "":
+        return True
+    if raw == "0":
+        return False
+    if raw == "1":
+        return True
+    return True
+
+
+def _cuda_tma_available(tensor: torch.Tensor) -> bool:
+    return (
+        _HAS_NATIVE_EXT
+        and tensor.is_cuda
+        and _cuda_tma_requested()
+        and torch.cuda.get_device_capability(tensor.device)[0] >= 9
+    )
+
+
+def _cuda_tma_batch_tile() -> int:
+    raw = os.environ.get("HOLYSHT_TMA_BATCH_TILE")
+    if raw is None or raw == "":
+        return 2
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return 2
+    return 1 if parsed <= 1 else 2
+
+
+def _aligned_mmax_for_tma(mmax: int, dtype: torch.dtype) -> int:
+    if dtype == torch.complex64:
+        elem_size = 8
+    elif dtype == torch.float32:
+        elem_size = 4
+    elif dtype in (torch.bfloat16, torch.float16):
+        elem_size = 2
+    else:
+        return mmax
+
+    quantum = max(1, 16 // elem_size)
+    return ((mmax + quantum - 1) // quantum) * quantum
+
+
+def _aligned_mmax_for_tma_tile(mmax: int) -> int:
+    # The public forward microkernels still advance `m` in 8-lane tiles, so
+    # padding only to the minimal 16-byte alignment leaves a slower partial
+    # tail. Keep both complex and real wrapper pads on the tile-aligned quantum.
+    return _aligned_mmax_for_tma(mmax, torch.bfloat16)
+
+
+def _pad_last_dim(x: torch.Tensor, padded_size: int) -> torch.Tensor:
+    if x.size(-1) == padded_size:
+        return x.contiguous()
+    out_shape = list(x.shape)
+    out_shape[-1] = padded_size
+    out = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
+    out[..., :x.size(-1)] = x
+    return out
+
+
+def _direct_legendre_forward_complex(input: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
+    output = torch.empty(
+        input.size(0), weight_t.size(0), input.size(2),
+        device=input.device, dtype=torch.complex64
+    )
+    _ops.fused_legendre_forward(output, input.contiguous(), weight_t)
+    return output
+
+
+def _direct_legendre_forward_real(input: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
+    output = torch.empty(
+        input.size(0), weight_t.size(0), input.size(2),
+        device=input.device, dtype=torch.float32
+    )
+    _ops.fused_legendre_forward_real(output, input.contiguous(), weight_t)
+    return output
+
+
+def _direct_vector_legendre_forward(
+    input: torch.Tensor,
+    weight0_t: torch.Tensor,
+    weight1_t: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty(
+        input.size(0), 2, weight0_t.size(0), input.size(3),
+        device=input.device, dtype=torch.complex64
+    )
+    _ops.fused_vector_legendre_forward(output, input.contiguous(), weight0_t, weight1_t)
+    return output
 
 
 def _prepare_irfft_input(x: torch.Tensor, nlon: int, active_mmax: Optional[int] = None) -> torch.Tensor:
@@ -684,6 +782,19 @@ class RealSHT(nn.Module):
             w_dtype = torch.float32
         self.register_buffer("weights", ref.weights.to(w_dtype))
         self.register_buffer("weight_t", ref.weights.float().permute(1, 2, 0).contiguous())
+        self._tma_mmax_complex = _aligned_mmax_for_tma_tile(self.mmax)
+        self._tma_mmax_real = _aligned_mmax_for_tma_tile(self.mmax)
+        self._tma_pad_complex_min_nlat = 512
+        self.register_buffer(
+            "weight_t_tma_complex",
+            _pad_last_dim(self.weight_t, self._tma_mmax_complex),
+            persistent=False,
+        )
+        self.register_buffer(
+            "weight_t_tma_real",
+            _pad_last_dim(self.weight_t, self._tma_mmax_real),
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._use_bf16:
@@ -693,6 +804,16 @@ class RealSHT(nn.Module):
                 xr = torch.view_as_real(x_fft)
                 if _HAS_NATIVE_EXT and x.is_cuda and not x.requires_grad:
                     xr_bf16 = xr.bfloat16().contiguous()
+                    if _cuda_tma_available(xr_bf16) and self._tma_mmax_real != self.mmax:
+                        out_re = _direct_legendre_forward_real(
+                            _pad_last_dim(xr_bf16[..., 0].contiguous(), self._tma_mmax_real),
+                            self.weight_t_tma_real,
+                        )[..., :self.mmax]
+                        out_im = _direct_legendre_forward_real(
+                            _pad_last_dim(xr_bf16[..., 1].contiguous(), self._tma_mmax_real),
+                            self.weight_t_tma_real,
+                        )[..., :self.mmax]
+                        return torch.complex(out_re, out_im)
                     out_re = fused_legendre_forward_real(xr_bf16[..., 0].contiguous(), self.weight_t)
                     out_im = fused_legendre_forward_real(xr_bf16[..., 1].contiguous(), self.weight_t)
                     return torch.complex(out_re, out_im)
@@ -716,6 +837,22 @@ class RealSHT(nn.Module):
                 xs = torch.cat([xr[..., 0], xr[..., 1]], dim=0).half()
                 out = torch.einsum("bkm,mlk->blm", xs, self.weights).float()
                 return torch.complex(out[:B], out[B:])
+        if (
+            _HAS_NATIVE_EXT
+            and x.is_cuda
+            and not x.requires_grad
+            and _cuda_tma_available(x)
+            and self._tma_mmax_complex != self.mmax
+            and self.nlat >= self._tma_pad_complex_min_nlat
+        ):
+            with _nvtx_range("holysht.scalar_forward_tma_pad"):
+                x_fft = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
+                x_fft = x_fft[..., :self.mmax].contiguous()
+                out = _direct_legendre_forward_complex(
+                    _pad_last_dim(x_fft, self._tma_mmax_complex),
+                    self.weight_t_tma_complex,
+                )
+                return out[..., :self.mmax]
         return fused_sht_forward(x, self.weights, self.mmax, self.weight_t)
 
 
@@ -808,6 +945,28 @@ class RealVectorSHT(nn.Module):
         self.register_buffer("w1", ref.weights[1].to(w_dtype))  # [mmax, lmax, nlat]
         self.register_buffer("w0_t", ref.weights[0].float().permute(1, 2, 0).contiguous())
         self.register_buffer("w1_t", ref.weights[1].float().permute(1, 2, 0).contiguous())
+        self._tma_mmax_complex = _aligned_mmax_for_tma_tile(self.mmax)
+        self._tma_mmax_real = _aligned_mmax_for_tma_tile(self.mmax)
+        self.register_buffer(
+            "w0_t_tma_complex",
+            _pad_last_dim(self.w0_t, self._tma_mmax_complex),
+            persistent=False,
+        )
+        self.register_buffer(
+            "w1_t_tma_complex",
+            _pad_last_dim(self.w1_t, self._tma_mmax_complex),
+            persistent=False,
+        )
+        self.register_buffer(
+            "w0_t_tma_real",
+            _pad_last_dim(self.w0_t, self._tma_mmax_real),
+            persistent=False,
+        )
+        self.register_buffer(
+            "w1_t_tma_real",
+            _pad_last_dim(self.w1_t, self._tma_mmax_real),
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-2] == self.nlat and x.shape[-1] == self.nlon
@@ -820,6 +979,18 @@ class RealVectorSHT(nn.Module):
             if (not self._use_bf16 and not self._use_fp16) and (_can_use_cuda_vector(x, self.w0_t, self.w1_t) or _can_use_metal_vector(x, self.w0_t, self.w1_t)):
                 B_shape = x.shape[:-3]
                 x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
+                if (
+                    x_flat.is_cuda
+                    and not x.requires_grad
+                    and _cuda_tma_available(x_flat)
+                    and self._tma_mmax_complex != mmax
+                ):
+                    out = _direct_vector_legendre_forward(
+                        _pad_last_dim(x_flat, self._tma_mmax_complex),
+                        self.w0_t_tma_complex,
+                        self.w1_t_tma_complex,
+                    )[..., :mmax]
+                    return out.reshape(B_shape + (2, self.lmax, mmax))
                 out = _FusedVectorLegendreForwardFn.apply(x_flat, self.w0_t, self.w1_t)
                 return out.reshape(B_shape + (2, self.lmax, mmax))
 
@@ -847,11 +1018,23 @@ class RealVectorSHT(nn.Module):
                 s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
             elif self._use_bf16 and _HAS_NATIVE_EXT and x00_flat.is_cuda and not x.requires_grad:
                 stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).bfloat16().contiguous()
-                out_w0 = fused_legendre_forward_real(stacked_w0, self.w0_t)
+                if _cuda_tma_available(stacked_w0) and self._tma_mmax_real != mmax:
+                    out_w0 = _direct_legendre_forward_real(
+                        _pad_last_dim(stacked_w0, self._tma_mmax_real),
+                        self.w0_t_tma_real,
+                    )[..., :mmax]
+                else:
+                    out_w0 = fused_legendre_forward_real(stacked_w0, self.w0_t)
                 r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
 
                 stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).bfloat16().contiguous()
-                out_w1 = fused_legendre_forward_real(stacked_w1, self.w1_t)
+                if _cuda_tma_available(stacked_w1) and self._tma_mmax_real != mmax:
+                    out_w1 = _direct_legendre_forward_real(
+                        _pad_last_dim(stacked_w1, self._tma_mmax_real),
+                        self.w1_t_tma_real,
+                    )[..., :mmax]
+                else:
+                    out_w1 = fused_legendre_forward_real(stacked_w1, self.w1_t)
                 s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
             elif (not self._use_bf16 and not self._use_fp16) and _can_use_native_real_legendre(x00_flat, self.w0_t):
                 stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).contiguous()
@@ -993,6 +1176,81 @@ class InverseRealVectorSHT(nn.Module):
             x_out = torch.view_as_complex(xs)
             x_out = _prepare_irfft_input(x_out, self.nlon, self.mmax)
             return torch.fft.irfft(x_out, n=self.nlon, dim=-1, norm="forward")
+
+
+class GraphedModule(nn.Module):
+    """Wraps an nn.Module with CUDA-graph capture+replay for the forward pass.
+
+    The first call for a given (input shape, dtype) captures a graph; subsequent
+    calls with a matching key copy the input into the captured static buffer
+    and replay the graph. This eliminates per-launch host overhead and is most
+    valuable on small grids where a non-trivial fraction of wall-clock time is
+    spent in cudaLaunchKernel rather than on the device.
+
+    Constraints (enforced by silently passing through):
+      - input must be on CUDA
+      - input must not require gradients (graphs replay forward-only)
+
+    Multiple shapes are supported via a small LRU cache; on overflow, the
+    oldest captured graph is dropped (along with its static buffers).
+    """
+
+    def __init__(self, module: nn.Module, num_warmup: int = 3, max_cached_shapes: int = 4):
+        super().__init__()
+        self.module = module
+        self._num_warmup = num_warmup
+        self._max_cached_shapes = max_cached_shapes
+        # Stored as plain attrs so nn.Module doesn't try to wrap them as
+        # parameters/buffers/submodules.
+        self._graph_cache = {}
+        self._graph_lru = []
+
+    def reset_graph_cache(self) -> None:
+        self._graph_cache.clear()
+        self._graph_lru.clear()
+
+    def _capture(self, x: torch.Tensor):
+        static_in = torch.empty_like(x)
+        static_in.copy_(x)
+
+        # Warmup on a side stream so allocator state matches the steady-state
+        # captured graph; this is the recommended PyTorch pattern.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(self._num_warmup):
+                _ = self.module(static_in)
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = self.module(static_in)
+        return static_in, static_out, graph
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda or x.requires_grad:
+            return self.module(x)
+
+        key = (tuple(x.shape), x.dtype)
+        entry = self._graph_cache.get(key)
+        if entry is None:
+            entry = self._capture(x)
+            self._graph_cache[key] = entry
+            self._graph_lru.append(key)
+            while len(self._graph_lru) > self._max_cached_shapes:
+                evicted = self._graph_lru.pop(0)
+                self._graph_cache.pop(evicted, None)
+        else:
+            # Refresh LRU position
+            self._graph_lru.remove(key)
+            self._graph_lru.append(key)
+
+        static_in, static_out, graph = entry
+        static_in.copy_(x)
+        graph.replay()
+        # Clone so the caller's tensor is decoupled from the captured static
+        # output buffer (the next replay will overwrite it).
+        return static_out.clone()
 
 
 legendre_forward = fused_legendre_forward

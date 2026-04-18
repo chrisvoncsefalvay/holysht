@@ -8,8 +8,8 @@ Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
 """
 
 import os
+import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "torch-ext"))
 
 import holysht
 from holysht import InverseRealSHT, InverseRealVectorSHT, RealSHT, RealVectorSHT
-from holysht import _prepare_irfft_input
+from holysht import _aligned_mmax_for_tma_tile, _prepare_irfft_input
 from torch_harmonics import (
     InverseRealSHT as RefInverseRealSHT,
     InverseRealVectorSHT as RefInverseRealVectorSHT,
@@ -29,13 +29,21 @@ from torch_harmonics import (
 
 HAS_CUDA = torch.cuda.is_available()
 HAS_MPS = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-
-pytestmark = pytest.mark.skipif(not (HAS_CUDA or HAS_MPS), reason="CUDA or MPS is required")
+CUDA_MAJOR = torch.cuda.get_device_capability()[0] if HAS_CUDA else 0
 
 DEVICE = torch.device("cuda" if HAS_CUDA else "mps")
 COEFF_ATOL = 1e-3 if DEVICE.type == "cuda" else 3e-3
 INVERSE_ATOL = 1e-2 if DEVICE.type == "cuda" else 2e-2
 GRAD_ATOL = 1e-3 if DEVICE.type == "cuda" else 3e-3
+
+
+@pytest.fixture(autouse=True)
+def _skip_gpu_only_tests(request):
+    if HAS_CUDA or HAS_MPS:
+        return
+    if request.node.get_closest_marker("cpu_ok") is not None:
+        return
+    pytest.skip("CUDA or MPS is required")
 
 
 def _to_test_device(module: torch.nn.Module) -> torch.nn.Module:
@@ -54,6 +62,12 @@ def complex_energy(x: torch.Tensor) -> torch.Tensor:
     return x.real.square().mean() + x.imag.square().mean()
 
 
+def upper_triangle_mask(lmax: int, mmax: int, device: torch.device) -> torch.Tensor:
+    l = torch.arange(lmax, device=device).unsqueeze(1)
+    m = torch.arange(mmax, device=device).unsqueeze(0)
+    return m > l
+
+
 def test_aliases_are_available():
     assert holysht.FusedRealSHT is holysht.RealSHT
     assert holysht.FusedInverseRealSHT is holysht.InverseRealSHT
@@ -61,6 +75,7 @@ def test_aliases_are_available():
     assert holysht.FusedInverseRealVectorSHT is holysht.InverseRealVectorSHT
 
 
+@pytest.mark.cpu_ok
 def test_autotune_batch_bucket_is_stable():
     assert holysht._autotune_batch_bucket(1) == "1"
     assert holysht._autotune_batch_bucket(2) == "2"
@@ -69,6 +84,7 @@ def test_autotune_batch_bucket_is_stable():
     assert holysht._autotune_batch_bucket(5) == "5+"
 
 
+@pytest.mark.cpu_ok
 def test_autotune_cache_roundtrip(tmp_path):
     cache_path = tmp_path / "autotune.json"
     cache = holysht._AutotuneCache(cache_path)
@@ -88,6 +104,7 @@ def test_autotune_cache_roundtrip(tmp_path):
     assert reloaded.load(key) == "tc_tf32"
 
 
+@pytest.mark.cpu_ok
 def test_force_backend_env_parser_accepts_known_values(monkeypatch):
     monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "tc_tf32")
     assert holysht._forced_cuda_forward_backend() == holysht._ForwardBackend.TC_TF32
@@ -97,6 +114,25 @@ def test_force_backend_env_parser_accepts_known_values(monkeypatch):
 
     monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "bogus")
     assert holysht._forced_cuda_forward_backend() == holysht._ForwardBackend.AUTO
+
+
+def test_public_tma_padding_uses_tile_aligned_m_quantum():
+    scalar_fp32 = RealSHT(256, 512)
+    scalar_bf16 = RealSHT(256, 512, dtype="bf16")
+    vector_fp32 = RealVectorSHT(256, 512)
+    vector_bf16 = RealVectorSHT(256, 512, dtype="bf16")
+
+    assert scalar_fp32._tma_mmax_complex == _aligned_mmax_for_tma_tile(scalar_fp32.mmax)
+    assert scalar_fp32.weight_t_tma_complex.size(-1) == scalar_fp32._tma_mmax_complex
+    assert scalar_bf16._tma_mmax_real == _aligned_mmax_for_tma_tile(scalar_bf16.mmax)
+    assert scalar_bf16.weight_t_tma_real.size(-1) == scalar_bf16._tma_mmax_real
+
+    assert vector_fp32._tma_mmax_complex == _aligned_mmax_for_tma_tile(vector_fp32.mmax)
+    assert vector_fp32.w0_t_tma_complex.size(-1) == vector_fp32._tma_mmax_complex
+    assert vector_fp32.w1_t_tma_complex.size(-1) == vector_fp32._tma_mmax_complex
+    assert vector_bf16._tma_mmax_real == _aligned_mmax_for_tma_tile(vector_bf16.mmax)
+    assert vector_bf16.w0_t_tma_real.size(-1) == vector_bf16._tma_mmax_real
+    assert vector_bf16.w1_t_tma_real.size(-1) == vector_bf16._tma_mmax_real
 
 
 # ============================================================================
@@ -249,6 +285,19 @@ def test_large_grid_scalar_forward(nlat, nlon):
     assert (opt_out - ref_out).abs().max().item() < COEFF_ATOL
 
 
+@pytest.mark.parametrize("nlat,nlon", [(256, 512)])
+def test_large_grid_scalar_forward_upper_triangle_is_zero(nlat, nlon):
+    torch.manual_seed(7)
+    opt_sht = _to_test_device(RealSHT(nlat, nlon))
+
+    x = torch.randn(2, nlat, nlon, device=DEVICE)
+    with torch.no_grad():
+        coeffs = opt_sht(x)
+
+    mask = upper_triangle_mask(opt_sht.lmax, opt_sht.mmax, coeffs.device)
+    assert coeffs[:, mask].abs().max().item() == 0.0
+
+
 @pytest.mark.parametrize("nlat,nlon", [(256, 512), (512, 1024)])
 def test_large_grid_scalar_inverse(nlat, nlon):
     """Tests the large-grid inverse kernel path."""
@@ -297,6 +346,19 @@ def test_large_grid_vector_forward(nlat, nlon):
     assert (opt_out - ref_out).abs().max().item() < COEFF_ATOL
 
 
+@pytest.mark.parametrize("nlat,nlon", [(256, 512)])
+def test_large_grid_vector_forward_upper_triangle_is_zero(nlat, nlon):
+    torch.manual_seed(7)
+    opt_vsht = _to_test_device(RealVectorSHT(nlat, nlon))
+
+    x = torch.randn(2, 2, nlat, nlon, device=DEVICE)
+    with torch.no_grad():
+        coeffs = opt_vsht(x)
+
+    mask = upper_triangle_mask(opt_vsht.lmax, opt_vsht.mmax, coeffs.device)
+    assert coeffs[:, :, mask].abs().max().item() == 0.0
+
+
 # ============================================================================
 # BF16 tests
 # ============================================================================
@@ -332,6 +394,55 @@ def test_bf16_vector_forward(nlat, nlon):
         bf16_out = bf16_vsht(x)
 
     assert (bf16_out - ref_out).abs().max().item() < 5e-3
+
+
+@pytest.mark.skipif(not HAS_CUDA or CUDA_MAJOR < 9, reason="TMA path requires CUDA SM90+")
+def test_cuda_tma_large_forward_paths_match_reference():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    env = os.environ.copy()
+    env["HOLYSHT_USE_TMA"] = "1"
+    env["HOLYSHT_TMA_BATCH_TILE"] = "2"
+    env["PYTHONPATH"] = os.path.join(repo_root, "torch-ext") + os.pathsep + env.get("PYTHONPATH", "")
+
+    script = r"""
+import torch
+from holysht import RealSHT, RealVectorSHT, _cuda_tma_batch_tile
+from torch_harmonics import RealSHT as RefRealSHT
+from torch_harmonics import RealVectorSHT as RefRealVectorSHT
+
+device = "cuda"
+if _cuda_tma_batch_tile() != 2:
+    raise SystemExit("expected HOLYSHT_TMA_BATCH_TILE=2 to be visible to the runtime")
+cases = [
+    ("scalar_fp32", lambda: RefRealSHT(256, 512).to(device), lambda: RealSHT(256, 512).to(device), (4, 256, 512), 1e-3),
+    ("scalar_bf16", lambda: RefRealSHT(256, 512).to(device), lambda: RealSHT(256, 512, dtype="bf16").to(device), (4, 256, 512), 5e-3),
+    ("vector_fp32", lambda: RefRealVectorSHT(256, 512).to(device), lambda: RealVectorSHT(256, 512).to(device), (4, 2, 256, 512), 1e-3),
+    ("scalar_fp32_tail", lambda: RefRealSHT(256, 512).to(device), lambda: RealSHT(256, 512).to(device), (3, 256, 512), 1e-3),
+]
+
+for name, ref_factory, opt_factory, shape, atol in cases:
+    torch.manual_seed(0)
+    x = torch.randn(*shape, device=device)
+    ref = ref_factory()
+    opt = opt_factory()
+    if opt.mmax % 8 == 0:
+        raise SystemExit(f"{name} unexpectedly has aligned mmax={opt.mmax}; test no longer exercises the padded TMA public path")
+    with torch.no_grad():
+        y_ref = ref(x)
+        y_opt = opt(x)
+    err = (y_opt - y_ref).abs().max().item()
+    if err >= atol:
+        raise SystemExit(f"{name} max error {err} >= {atol}")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 # ============================================================================
