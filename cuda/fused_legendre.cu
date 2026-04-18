@@ -668,7 +668,7 @@ __global__ void fused_legendre_forward_real_tf32_kernel(
             if (l < lmax && k < nlat) {
                 value = static_cast<float>(weight_t[(int)l * nlat * mmax + (int)k * mmax + m]);
             }
-            a_tile[idx] = value;
+            a_tile[idx] = __float_to_tf32(value);
         }
         #pragma unroll
         for (int idx = lane; idx < 8 * 16; idx += 32) {
@@ -680,7 +680,7 @@ __global__ void fused_legendre_forward_real_tf32_kernel(
             if (b < batch_size && k < nlat) {
                 value = static_cast<float>(input[(int)b * nlat * mmax + (int)k * mmax + m]);
             }
-            b_tile[col * 8 + kk] = value;
+            b_tile[col * 8 + kk] = __float_to_tf32(value);
         }
 
         __syncthreads();
