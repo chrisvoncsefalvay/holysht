@@ -444,7 +444,7 @@ def _direct_legendre_forward_real(
         input.size(0), weight_t.size(0), input.size(2),
         device=input.device, dtype=torch.float32
     )
-    if hasattr(_ops, "fused_legendre_forward_real_ex"):
+    if input.is_cuda and hasattr(_ops, "fused_legendre_forward_real_ex"):
         _ops.fused_legendre_forward_real_ex(output, input.contiguous(), weight_t, int(backend_hint))
     else:
         _ops.fused_legendre_forward_real(output, input.contiguous(), weight_t)
@@ -461,7 +461,7 @@ def _direct_vector_legendre_forward(
         input.size(0), 2, weight0_t.size(0), input.size(3),
         device=input.device, dtype=torch.complex64
     )
-    if hasattr(_ops, "fused_vector_legendre_forward_ex"):
+    if input.is_cuda and hasattr(_ops, "fused_vector_legendre_forward_ex"):
         _ops.fused_vector_legendre_forward_ex(
             output,
             input.contiguous(),

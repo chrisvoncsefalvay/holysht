@@ -476,6 +476,62 @@ def test_direct_vector_forward_accepts_backend_hint():
     assert out.shape == (2, 2, 32, 17)
 
 
+def test_direct_real_forward_uses_legacy_op_off_cuda(monkeypatch):
+    calls = []
+
+    class FakeOps:
+        def fused_legendre_forward_real(self, output, input, weight_t):
+            calls.append("legacy")
+            return output
+
+        def fused_legendre_forward_real_ex(self, output, input, weight_t, backend_hint):
+            calls.append("ex")
+            return output
+
+    monkeypatch.setattr(holysht, "_ops", FakeOps())
+
+    weight_t = torch.randn(8, 4, 5)
+    x = torch.randn(2, 4, 5)
+
+    out = holysht._direct_legendre_forward_real(
+        x,
+        weight_t,
+        backend_hint=holysht._ForwardBackend.FMA,
+    )
+
+    assert out.shape == (2, 8, 5)
+    assert calls == ["legacy"]
+
+
+def test_direct_vector_forward_uses_legacy_op_off_cuda(monkeypatch):
+    calls = []
+
+    class FakeOps:
+        def fused_vector_legendre_forward(self, output, input, weight0_t, weight1_t):
+            calls.append("legacy")
+            return output
+
+        def fused_vector_legendre_forward_ex(self, output, input, weight0_t, weight1_t, backend_hint):
+            calls.append("ex")
+            return output
+
+    monkeypatch.setattr(holysht, "_ops", FakeOps())
+
+    weight0_t = torch.randn(8, 4, 5)
+    weight1_t = torch.randn(8, 4, 5)
+    x = torch.randn(2, 2, 4, 5, dtype=torch.complex64)
+
+    out = holysht._direct_vector_legendre_forward(
+        x,
+        weight0_t,
+        weight1_t,
+        backend_hint=holysht._ForwardBackend.FMA,
+    )
+
+    assert out.shape == (2, 2, 8, 5)
+    assert calls == ["legacy"]
+
+
 # ============================================================================
 # _prepare_irfft_input tests
 # ============================================================================
