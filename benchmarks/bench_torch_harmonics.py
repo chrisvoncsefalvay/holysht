@@ -124,6 +124,15 @@ def empty_device_cache():
         torch.mps.empty_cache()
 
 
+def log_progress(msg: str):
+    """Print progress message and flush immediately for real-time visibility."""
+    print(f"  >> {msg}", flush=True)
+
+
+def current_forced_backend() -> str:
+    return os.environ.get("HOLYSHT_FORCE_BACKEND", "").strip().lower() or "auto"
+
+
 def device_timer(fn, n_warmup=20, n_iters=100):
     """Median-of-n GPU time in milliseconds."""
     for _ in range(n_warmup):
@@ -316,6 +325,8 @@ def bench_scalar_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
         for B in batch_sizes:
             if should_skip_case("RealSHT.forward", nlat, nlon, B):
                 continue
+            log_progress(f"RealSHT.forward {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+            t0 = time.perf_counter()
             ref_sht = to_device_module(RealSHT(nlat, nlon))
             fused_sht = to_device_module(HollyRealSHT(nlat, nlon))
             x = torch.randn(B, nlat, nlon, device=DEVICE)
@@ -331,6 +342,10 @@ def bench_scalar_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
             # Performance
             ref_ms = device_timer(lambda: ref_sht(x), n_warmup, n_iters)
             holysht_ms = device_timer(lambda: fused_sht(x), n_warmup, n_iters)
+            speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+            elapsed = time.perf_counter() - t0
+            log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
             results.append(BenchResult(
                 test_name="RealSHT.forward",
@@ -338,7 +353,7 @@ def bench_scalar_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
                 batch_size=B,
                 ref_ms=round(ref_ms, 4),
                 holysht_ms=round(holysht_ms, 4),
-                speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+                speedup=speedup,
                 max_abs_err=mae,
                 max_rel_err=mre,
                 correct=ok,
@@ -356,6 +371,8 @@ def bench_scalar_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
         for B in batch_sizes:
             if should_skip_case("InverseRealSHT.forward", nlat, nlon, B):
                 continue
+            log_progress(f"InverseRealSHT.forward {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+            t0 = time.perf_counter()
             ref_sht = to_device_module(RealSHT(nlat, nlon))
             ref_isht = to_device_module(InverseRealSHT(nlat, nlon))
             fused_isht = to_device_module(HollyInverseRealSHT(nlat, nlon))
@@ -371,6 +388,10 @@ def bench_scalar_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
 
             ref_ms = device_timer(lambda: ref_isht(coeffs), n_warmup, n_iters)
             holysht_ms = device_timer(lambda: fused_isht(coeffs), n_warmup, n_iters)
+            speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+            elapsed = time.perf_counter() - t0
+            log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
             results.append(BenchResult(
                 test_name="InverseRealSHT.forward",
@@ -378,7 +399,7 @@ def bench_scalar_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
                 batch_size=B,
                 ref_ms=round(ref_ms, 4),
                 holysht_ms=round(holysht_ms, 4),
-                speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+                speedup=speedup,
                 max_abs_err=mae,
                 max_rel_err=mre,
                 correct=ok,
@@ -396,6 +417,8 @@ def bench_roundtrip(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[BenchR
         for B in batch_sizes:
             if should_skip_case("Roundtrip(SHT→ISHT)", nlat, nlon, B):
                 continue
+            log_progress(f"Roundtrip(SHT→ISHT) {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+            t0 = time.perf_counter()
             ref_sht = to_device_module(RealSHT(nlat, nlon))
             ref_isht = to_device_module(InverseRealSHT(nlat, nlon))
             fused_sht = to_device_module(HollyRealSHT(nlat, nlon))
@@ -423,6 +446,10 @@ def bench_roundtrip(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[BenchR
 
             ref_ms = device_timer(ref_fn, n_warmup, n_iters)
             holysht_ms = device_timer(fused_fn, n_warmup, n_iters)
+            speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+            elapsed = time.perf_counter() - t0
+            log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
             results.append(BenchResult(
                 test_name="Roundtrip(SHT→ISHT)",
@@ -430,7 +457,7 @@ def bench_roundtrip(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[BenchR
                 batch_size=B,
                 ref_ms=round(ref_ms, 4),
                 holysht_ms=round(holysht_ms, 4),
-                speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+                speedup=speedup,
                 max_abs_err=mae,
                 max_rel_err=mre,
                 correct=ok,
@@ -448,6 +475,8 @@ def bench_vector_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
         for B in batch_sizes:
             if should_skip_case("RealVectorSHT.forward", nlat, nlon, B):
                 continue
+            log_progress(f"RealVectorSHT.forward {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+            t0 = time.perf_counter()
             ref_vsht = to_device_module(RealVectorSHT(nlat, nlon))
             fused_vsht = to_device_module(HollyRealVectorSHT(nlat, nlon))
             x = torch.randn(B, 2, nlat, nlon, device=DEVICE)
@@ -461,6 +490,10 @@ def bench_vector_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
 
             ref_ms = device_timer(lambda: ref_vsht(x), n_warmup, n_iters)
             holysht_ms = device_timer(lambda: fused_vsht(x), n_warmup, n_iters)
+            speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+            elapsed = time.perf_counter() - t0
+            log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
             results.append(BenchResult(
                 test_name="RealVectorSHT.forward",
@@ -468,7 +501,7 @@ def bench_vector_sht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Bench
                 batch_size=B,
                 ref_ms=round(ref_ms, 4),
                 holysht_ms=round(holysht_ms, 4),
-                speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+                speedup=speedup,
                 max_abs_err=mae,
                 max_rel_err=mre,
                 correct=ok,
@@ -486,6 +519,8 @@ def bench_vector_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
         for B in batch_sizes:
             if should_skip_case("InverseRealVectorSHT.forward", nlat, nlon, B):
                 continue
+            log_progress(f"RealVectorISHT.forward {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+            t0 = time.perf_counter()
             ref_vsht = to_device_module(RealVectorSHT(nlat, nlon))
             ref_ivsht = to_device_module(InverseRealVectorSHT(nlat, nlon))
             fused_ivsht = to_device_module(HollyInverseRealVectorSHT(nlat, nlon))
@@ -501,6 +536,10 @@ def bench_vector_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
 
             ref_ms = device_timer(lambda: ref_ivsht(coeffs), n_warmup, n_iters)
             holysht_ms = device_timer(lambda: fused_ivsht(coeffs), n_warmup, n_iters)
+            speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+            elapsed = time.perf_counter() - t0
+            log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
             results.append(BenchResult(
                 test_name="InverseRealVectorSHT.forward",
@@ -508,7 +547,7 @@ def bench_vector_isht(grids, batch_sizes, n_warmup=20, n_iters=100) -> List[Benc
                 batch_size=B,
                 ref_ms=round(ref_ms, 4),
                 holysht_ms=round(holysht_ms, 4),
-                speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+                speedup=speedup,
                 max_abs_err=mae,
                 max_rel_err=mre,
                 correct=ok,
@@ -530,6 +569,8 @@ def bench_ynm_synthesis(lmax=64, n_warmup=20, n_iters=100) -> List[BenchResult]:
     nlat, nlon = 2 * lmax, 4 * lmax
     if should_skip_case("Y_n^m synthesis (ISHT, sparse)", nlat, nlon, 1, lmax=lmax, mmax=lmax):
         return results
+    log_progress(f"Y_n^m synthesis {nlat}x{nlon} lmax={lmax} backend={current_forced_backend()} ...")
+    t0 = time.perf_counter()
 
     ref_isht = to_device_module(InverseRealSHT(nlat, nlon, lmax=lmax, mmax=lmax))
     fused_isht = to_device_module(HollyInverseRealSHT(nlat, nlon, lmax=lmax, mmax=lmax))
@@ -552,6 +593,10 @@ def bench_ynm_synthesis(lmax=64, n_warmup=20, n_iters=100) -> List[BenchResult]:
 
     ref_ms = device_timer(lambda: ref_isht(coeffs), n_warmup, n_iters)
     holysht_ms = device_timer(lambda: fused_isht(coeffs), n_warmup, n_iters)
+    speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+    elapsed = time.perf_counter() - t0
+    log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
     results.append(BenchResult(
         test_name="Y_n^m synthesis (ISHT, sparse)",
@@ -559,7 +604,7 @@ def bench_ynm_synthesis(lmax=64, n_warmup=20, n_iters=100) -> List[BenchResult]:
         batch_size=1,
         ref_ms=round(ref_ms, 4),
         holysht_ms=round(holysht_ms, 4),
-        speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+        speedup=speedup,
         max_abs_err=max_err_overall,
         max_rel_err=0.0,  # not meaningful for sparse coefficients
         correct=ok,
@@ -580,6 +625,8 @@ def bench_bf16_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
     for nlat, nlon in grids:
         if should_skip_case("RealSHT.forward (BF16)", nlat, nlon, B):
             continue
+        log_progress(f"BF16 RealSHT.forward {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+        t0 = time.perf_counter()
         ref_sht = to_device_module(RealSHT(nlat, nlon))
         fused_bf16 = to_device_module(HollyRealSHT(nlat, nlon, dtype="bf16"))
 
@@ -595,6 +642,10 @@ def bench_bf16_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
 
         ref_ms = device_timer(lambda: ref_sht(x), n_warmup, n_iters)
         holysht_ms = device_timer(lambda: fused_bf16(x), n_warmup, n_iters)
+        speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+        elapsed = time.perf_counter() - t0
+        log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
         results.append(BenchResult(
             test_name="RealSHT.forward (BF16)",
@@ -602,7 +653,7 @@ def bench_bf16_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
             batch_size=B,
             ref_ms=round(ref_ms, 4),
             holysht_ms=round(holysht_ms, 4),
-            speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+            speedup=speedup,
             max_abs_err=mae,
             max_rel_err=mre,
             correct=ok,
@@ -623,6 +674,8 @@ def bench_bf16_vector_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
     for nlat, nlon in grids:
         if should_skip_case("RealVectorSHT.forward (BF16)", nlat, nlon, B):
             continue
+        log_progress(f"BF16 RealVectorSHT.forward {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+        t0 = time.perf_counter()
         ref_vsht = to_device_module(RealVectorSHT(nlat, nlon))
         fused_bf16 = to_device_module(HollyRealVectorSHT(nlat, nlon, dtype="bf16"))
 
@@ -636,6 +689,10 @@ def bench_bf16_vector_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
 
         ref_ms = device_timer(lambda: ref_vsht(x), n_warmup, n_iters)
         holysht_ms = device_timer(lambda: fused_bf16(x), n_warmup, n_iters)
+        speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+        elapsed = time.perf_counter() - t0
+        log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
         results.append(BenchResult(
             test_name="RealVectorSHT.forward (BF16)",
@@ -643,7 +700,7 @@ def bench_bf16_vector_sht(grids, n_warmup=20, n_iters=100) -> List[BenchResult]:
             batch_size=B,
             ref_ms=round(ref_ms, 4),
             holysht_ms=round(holysht_ms, 4),
-            speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+            speedup=speedup,
             max_abs_err=mae,
             max_rel_err=mre,
             correct=ok,
@@ -661,6 +718,8 @@ def bench_scalar_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
         for B in batch_sizes:
             if should_skip_case("RealSHT.forward+backward", nlat, nlon, B):
                 continue
+            log_progress(f"Scalar forward+backward {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+            t0 = time.perf_counter()
             ref_sht = to_device_module(RealSHT(nlat, nlon))
             fused_sht = to_device_module(HollyRealSHT(nlat, nlon))
 
@@ -687,6 +746,10 @@ def bench_scalar_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
 
             ref_ms = device_timer(ref_fn, n_warmup, n_iters)
             holysht_ms = device_timer(holysht_fn, n_warmup, n_iters)
+            speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+            elapsed = time.perf_counter() - t0
+            log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
             results.append(BenchResult(
                 test_name="RealSHT.forward+backward",
@@ -694,7 +757,7 @@ def bench_scalar_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
                 batch_size=B,
                 ref_ms=round(ref_ms, 4),
                 holysht_ms=round(holysht_ms, 4),
-                speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+                speedup=speedup,
                 max_abs_err=mae,
                 max_rel_err=mre,
                 correct=ok,
@@ -712,6 +775,8 @@ def bench_vector_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
         for B in batch_sizes:
             if should_skip_case("RealVectorSHT.forward+backward", nlat, nlon, B):
                 continue
+            log_progress(f"Vector forward+backward {nlat}x{nlon} B={B} backend={current_forced_backend()} ...")
+            t0 = time.perf_counter()
             ref_vsht = to_device_module(RealVectorSHT(nlat, nlon))
             fused_vsht = to_device_module(HollyRealVectorSHT(nlat, nlon))
 
@@ -738,6 +803,10 @@ def bench_vector_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
 
             ref_ms = device_timer(ref_fn, n_warmup, n_iters)
             holysht_ms = device_timer(holysht_fn, n_warmup, n_iters)
+            speedup = round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0
+
+            elapsed = time.perf_counter() - t0
+            log_progress(f"  ref={ref_ms:.3f}ms  holysht={holysht_ms:.3f}ms  {speedup}x  {'PASS' if ok else 'FAIL'}  ({elapsed:.1f}s)")
 
             results.append(BenchResult(
                 test_name="RealVectorSHT.forward+backward",
@@ -745,7 +814,7 @@ def bench_vector_train(grids, batch_sizes, n_warmup=10, n_iters=50) -> List[Benc
                 batch_size=B,
                 ref_ms=round(ref_ms, 4),
                 holysht_ms=round(holysht_ms, 4),
-                speedup=round(ref_ms / holysht_ms, 2) if holysht_ms > 0 else 0,
+                speedup=speedup,
                 max_abs_err=mae,
                 max_rel_err=mre,
                 correct=ok,
@@ -816,6 +885,12 @@ def main():
         choices=["auto", "cuda", "mps"],
         help="Execution backend to benchmark.",
     )
+    parser.add_argument(
+        "--force-backend",
+        default=os.environ.get("HOLYSHT_FORCE_BACKEND", "").strip().lower() or "auto",
+        choices=["auto", "fma", "tma", "tc_tf32", "tc_bf16"],
+        help="Force a HOLYSHT forward backend for the benchmark run.",
+    )
     parser.add_argument("--output", default=None,
                         help="JSON output path (default: data/bench_torch_harmonics.json)")
     parser.add_argument(
@@ -863,6 +938,7 @@ def main():
 
     global DEVICE
     DEVICE = resolve_device(args.device)
+    os.environ["HOLYSHT_FORCE_BACKEND"] = args.force_backend
 
     global MAX_CASE_ALLOC_BYTES
     MAX_CASE_ALLOC_BYTES = None if args.max_alloc_gib <= 0 else int(args.max_alloc_gib * GiB)
@@ -894,6 +970,7 @@ def main():
         print(f"Visible GPU memory: {total_mem_gib:.2f} GiB")
     print(f"PyTorch: {torch.__version__}")
     print(f"Backend: {DEVICE.type}")
+    print(f"Forced HOLYSHT backend: {args.force_backend}")
     if backend_version:
         print(f"CUDA: {backend_version}")
     print(f"Grids: {grids}")
@@ -963,8 +1040,9 @@ def main():
         all_results.extend(rv)
         print()
 
-    train_warmup = max(5, n_warmup // 2)
-    train_iters = max(20, n_iters // 2)
+    # Respect explicit --iters/--warmup overrides; only apply /2 floor when using defaults
+    train_warmup = n_warmup if args.warmup is not None else max(5, n_warmup // 2)
+    train_iters = n_iters if args.iters is not None else max(20, n_iters // 2)
     train_grids = grids if args.grids is not None else ([(256, 512)] if args.quick else [(256, 512), (512, 1024), (720, 1440)])
     train_batch_sizes = batch_sizes if args.batch_sizes is not None else [4]
 

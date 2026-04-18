@@ -7,6 +7,11 @@ arm64 Macs, dedicated vector SHT kernels, explicit autograd support,
 mixed-precision forward paths, and a profiling setup that can be run safely on
 a GB10 without blowing memory.
 
+The Hugging Face kernel distribution is intentionally forward-only. That is a
+deliberate packaging choice: the fastest, most tuned path is forward SHT, while
+inverse and training support remain in the main source tree for local
+development and regression coverage.
+
 The package is designed as a practical companion to
 [`torch-harmonics`](https://github.com/NVIDIA/torch-harmonics), not a full
 reimplementation. HOLYSHT still reuses `torch-harmonics` to generate quadrature
@@ -42,96 +47,126 @@ tuned for the current target.
 
 ## Performance
 
-Benchmarked on an NVIDIA GB10 with PyTorch 2.10.0+cu130, CUDA 13.0, batch
-size 4. All 20 correctness checks passed; mean speedup **3.9x**.
+Forward benchmarks were rerun on April 18, 2026 on an NVIDIA GB10 with
+PyTorch `2.10.0+cu130`, CUDA `13.0`, batch size `4`, and
 
-On Apple Silicon, the Metal backend is validated on an Apple M4 Mac mini with
-PyTorch 2.11.0. The quick MPS benchmark passes all 18 correctness checks with a
-mean speedup of **1.7x** over `torch-harmonics`, peaking at **2.6x** for vector
-forward SHT on `512x1024`.
+```bash
+PYTHONPATH=torch-ext HOLYSHT_USE_TMA=1 python3 benchmarks/bench_torch_harmonics.py \
+  --scenarios scalar-forward,vector-forward,bf16-forward \
+  --grids 256x512,512x1024 \
+  --batch-sizes 4 \
+  --warmup 10 \
+  --iters 30 \
+  --max-alloc-gib 6
+```
 
-<p align="center">
-  <img src="assets/speedup.png" alt="Speedup factors across all benchmark cases" width="600">
-</p>
+All `8/8` forward checks passed; the mean speedup over `torch-harmonics` was
+**5.8x**.
 
-Vector SHT benefits most (up to **8.7x**) because the fused kernel avoids two
-separate Legendre passes. Scalar forward peaks at **4.6x** on the 256×512 grid
-where the tiled shared-memory kernel is most effective. BF16 paths use an
-einsum shortcut (not the CUDA kernels), so speedup there is modest (~1.6x).
+| Workload | Grid | torch-harmonics | HOLYSHT | Speedup | MaxAbsErr |
+|---|---|---:|---:|---:|---:|
+| `RealSHT.forward` | `256x512` | 2.580 ms | 0.681 ms | 3.8x | `2.24e-08` |
+| `RealSHT.forward` | `512x1024` | 19.420 ms | 3.453 ms | 5.6x | `1.78e-08` |
+| `RealVectorSHT.forward` | `256x512` | 9.961 ms | 0.978 ms | 10.2x | `1.30e-08` |
+| `RealVectorSHT.forward` | `512x1024` | 77.319 ms | 6.858 ms | 11.3x | `6.49e-09` |
+| `RealSHT.forward (BF16)` | `256x512` | 2.530 ms | 0.540 ms | 4.7x | `6.95e-05` |
+| `RealSHT.forward (BF16)` | `512x1024` | 19.342 ms | 6.558 ms | 3.0x | `3.45e-05` |
+| `RealVectorSHT.forward (BF16)` | `256x512` | 9.959 ms | 2.049 ms | 4.9x | `3.38e-05` |
+| `RealVectorSHT.forward (BF16)` | `512x1024` | 77.177 ms | 26.347 ms | 2.9x | `1.16e-05` |
 
-<p align="center">
-  <img src="assets/latency.png" alt="Absolute latency comparison by operation" width="800">
-</p>
+The large Hopper/Blackwell forward path is now a real microkernel rather than
+just "TMA for the input tile": each large forward TMA block can process two
+batch lanes at once, so the weight stream is reused across multiple outputs
+instead of being paid once per batch item. BF16 still goes through the native
+CUDA real Legendre kernels on GB10, but now benefits from the same batch-tiled
+forward microkernel. FP32 forward can also route through the TF32 WMMA kernel
+when the autotuner selects `tc_tf32`. `tc_bf16` is currently an explicit
+compatibility alias that falls back to the legacy real forward path until a
+true BF16 tensor-core kernel lands.
 
-<details>
-<summary>Full benchmark table</summary>
+Odd-`mmax` public forward shapes are still padded into tile-aligned temporary
+spectral slabs before the Legendre stage when that actually helps on GB10.
+TMA itself only needs 16-byte alignment, but the current forward microkernels
+still prefer 8-wide `m` tiles, so the complex public path intentionally keeps
+the wider pad.
 
-### Scalar SHT
-
-| Workload | Grid | torch-harmonics | HOLYSHT | Speedup |
-|---|---|---:|---:|---:|
-| Forward | 64x128 | 0.089 ms | 0.030 ms | 2.9x |
-| Forward | 256x512 | 2.473 ms | 0.534 ms | 4.6x |
-| Forward | 512x1024 | 18.959 ms | 6.192 ms | 3.1x |
-| Inverse | 64x128 | 0.065 ms | 0.032 ms | 2.0x |
-| Inverse | 256x512 | 1.269 ms | 0.847 ms | 1.5x |
-| Inverse | 512x1024 | 9.566 ms | 6.100 ms | 1.6x |
-| Forward + inverse | 64x128 | 0.148 ms | 0.057 ms | 2.6x |
-| Forward + inverse | 256x512 | 3.804 ms | 1.324 ms | 2.9x |
-| Forward + inverse | 512x1024 | 28.555 ms | 12.221 ms | 2.3x |
-| Forward + backward | 256x512 | 3.489 ms | 1.512 ms | 2.3x |
-
-### Vector SHT
-
-| Workload | Grid | torch-harmonics | HOLYSHT | Speedup |
-|---|---|---:|---:|---:|
-| Forward | 64x128 | 0.299 ms | 0.034 ms | 8.7x |
-| Forward | 256x512 | 9.821 ms | 1.135 ms | 8.7x |
-| Forward | 512x1024 | 74.689 ms | 12.545 ms | 6.0x |
-| Inverse | 64x128 | 0.312 ms | 0.036 ms | 8.7x |
-| Inverse | 256x512 | 9.524 ms | 1.820 ms | 5.2x |
-| Inverse | 512x1024 | 74.351 ms | 14.374 ms | 5.2x |
-| Forward + backward | 256x512 | 13.723 ms | 3.162 ms | 4.3x |
-
-### BF16
-
-| Workload | Grid | torch-harmonics | HOLYSHT | Speedup |
-|---|---|---:|---:|---:|
-| Scalar forward | 512x1024 | 18.881 ms | 11.852 ms | 1.6x |
-| Vector forward | 512x1024 | 74.606 ms | 47.304 ms | 1.6x |
-
-</details>
+The Apple Metal/MPS backend remains in-tree and validated separately on Apple
+Silicon; the table above is the current GB10 forward rerun.
 
 ## Profiling and resources
 
-The project now ships a lightweight profiling path that avoids the heavyweight
+The project ships a lightweight profiling path that avoids the heavyweight
 `kernel-builder` workflow during normal development:
 
 - First import builds a local torch extension under `build/torch_extensions/`.
 - The loader defaults to `MAX_JOBS=1` and `TORCH_CUDA_ARCH_LIST=12.0+PTX` on
   GB10-class machines.
+- `HOLYSHT_USE_TMA=0` or `1` now disables or forces the Hopper/Blackwell TMA
+  path for A/B profiling.
+- `HOLYSHT_TMA_BATCH_TILE=1` or `2` selects whether the large forward TMA path
+  processes one or two batch lanes per block.
+- `HOLYSHT_FORCE_BACKEND` can be set to `fma`, `tma`, `tc_tf32`, or
+  `tc_bf16`. The benchmark runner and module forwards surface the selected
+  backend in logs when this is set.
+- `HOLYSHT_AUTOTUNE=1` enables the forward backend selector. Results are cached
+  in `~/.cache/holysht/holysht_autotune_cache.json` by default, or at the path
+  named by `HOLYSHT_AUTOTUNE_CACHE_PATH`. `XDG_CACHE_HOME` shifts that default
+  user cache root.
 - `scripts/profile_nsys.sh` profiles the scalar forward case with `nsys`.
 - `scripts/profile_ncu.sh` attempts `ncu`; if GPU counters are unavailable for
   the current user it falls back to `scripts/report_resources.py`.
 
+One caveat from the current branch: public SHT workloads derived from even
+`nlon` usually have `mmax = nlon / 2 + 1`, which is odd. On GB10 that means the
+raw Legendre input stride is not 16-byte aligned. The public forward wrappers
+handle that by padding into a tile-aligned temporary slab for vector forward,
+BF16 forward, and large scalar forward. Small scalar FP32 shapes such as
+`256x512` still stay on the packed non-TMA kernel because the padding overhead
+was slower there.
+
 Representative `nsys` runs on `512x1024`, batch `4`:
 
-- `fused_legendre_forward_large_kernel<8>` averaged `6.18 ms` across `31`
-  launches in the scalar-forward profile.
-- `fused_vector_legendre_forward_large_kernel<8>` averaged `12.42 ms` across
-  `31` launches in the vector-forward profile.
+- `fused_legendre_forward_large_tma_batch2_kernel<8>` averaged **3.20 ms** per
+  launch on `RealSHT.forward(512x1024, batch=4)`.
+- `fused_vector_legendre_forward_large_tma_batch2_kernel<8>` averaged
+  **6.43 ms** per launch on `RealVectorSHT.forward(512x1024, batch=4)`.
 
-Current resource snapshot from `cuobjdump --dump-resource-usage` on the local
-build:
+The most useful A/B on GB10 is now `HOLYSHT_TMA_BATCH_TILE=1` vs `2` on the
+public forward workloads. On batch `4`, the batch-tiled microkernel wins by
+reusing weights across two batch lanes:
+
+| Public forward case | `B_TILE=1` | `B_TILE=2` | Delta |
+|---|---:|---:|---:|
+| `RealSHT.forward 512x1024` | 6.419 ms | 3.453 ms | 1.86x |
+| `RealVectorSHT.forward 512x1024` | 12.983 ms | 6.858 ms | 1.89x |
+| `RealSHT.forward (BF16) 512x1024` | 12.601 ms | 6.558 ms | 1.92x |
+| `RealVectorSHT.forward (BF16) 512x1024` | 50.365 ms | 26.347 ms | 1.91x |
+
+That is a much healthier place to be, but it is not the end of the road. The
+current microkernel still scalar-loads the weight tile inside each thread; it
+just amortises those loads across two batch lanes. The next Hopper/Blackwell
+step is still a denser weight-staging / tensor-core formulation rather than
+more input-side plumbing.
+
+Current forward-kernel resource snapshot from
+`PYTHONPATH=torch-ext python3 scripts/report_resources.py` on GB10:
 
 | Kernel | Regs/thread | Shared/block | Block threads | Active blocks/SM | Theoretical occupancy |
 |---|---:|---:|---:|---:|---:|
-| Scalar forward large | 38 | 3136 B | 256 | 6 | 100.0% |
-| Scalar inverse large | 40 | 3136 B | 256 | 6 | 100.0% |
-| Vector forward large | 37 | 5248 B | 256 | 6 | 100.0% |
-| Vector inverse large | 40 | 5248 B | 256 | 6 | 100.0% |
-| BF16 forward large | 34 | 2080 B | 256 | 6 | 100.0% |
-| `prepare_irfft` | 19 | 0 B | n/a | n/a | n/a |
+| Scalar forward large | 63 | 5248 B | 256 | 4 | 66.7% |
+| Scalar forward large TMA | 48 | 9224 B | 256 | 5 | 83.3% |
+| Scalar forward large TMA batch2 | 59 | 17424 B | 256 | 4 | 66.7% |
+| Vector forward large | 64 | 9472 B | 256 | 4 | 66.7% |
+| Vector forward large TMA | 48 | 17424 B | 256 | 5 | 83.3% |
+| Vector forward large TMA batch2 | 24 | 33824 B | 256 | 3 | 50.0% |
+| BF16 forward large | 63 | 3136 B | 256 | 4 | 66.7% |
+| BF16 forward large TMA | 40 | 3080 B | 256 | 6 | 100.0% |
+| BF16 forward large TMA batch2 | 40 | 5136 B | 256 | 6 | 100.0% |
+
+The vector batch2 kernel is the clearest tradeoff: it gives up occupancy to
+buy much higher weight reuse. On GB10 that trade is absolutely worth it, which
+is why the measured runtime still drops from `12.983 ms` to `6.858 ms` on the
+`512x1024`, batch `4` case.
 
 ## Public API
 
@@ -180,6 +215,15 @@ paths.
 - `HOLYSHT_MPS_VECTOR_INVERSE_NATIVE=1` forces the native Metal vector-inverse
   path for tuning experiments; `=0` forces the fallback path.
 - `HOLYSHT_ENABLE_NVTX=1` enables NVTX ranges around the public hot paths.
+- `HOLYSHT_USE_TMA=0` disables the Hopper/Blackwell TMA path; `=1` forces it
+  on when the tensor layout satisfies the 16-byte stride requirements or when
+  the public forward wrappers can cheaply pad into an aligned temporary slab.
+- `HOLYSHT_TMA_BATCH_TILE=1` keeps the original one-batch-per-block TMA
+  forward kernels; `=2` enables the batch-tiled forward microkernel and is the
+  default on Hopper/Blackwell.
+- `tc_bf16` is accepted as a backend hint for API compatibility, but it still
+  degrades to the legacy real forward path until a real BF16 tensor-core
+  implementation is added.
 - `HOLYSHT_USE_FAST_MATH=0` disables `--use_fast_math` for the local JIT build.
 - `build.toml` is pinned to `sm_120` for the kernel-builder path so it no
   longer tries to fan out across a wide architecture matrix on GB10.

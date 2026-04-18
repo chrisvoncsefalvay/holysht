@@ -78,49 +78,101 @@ def active_blocks_per_sm(kernel: KernelResource, props) -> tuple[int | None, flo
 
 
 def short_name(name: str) -> str:
+    if "fused_legendre_forward_large_tma_batch2_kernel" in name:
+        return "scalar forward large tma batch2"
+    if "fused_legendre_forward_large_tma_kernel" in name:
+        return "scalar forward large tma"
     if "fused_legendre_forward_large_kernel" in name:
         return "scalar forward large"
+    if "fused_legendre_inverse_large_tma_kernel" in name:
+        return "scalar inverse large tma"
     if "fused_legendre_inverse_large_kernel" in name:
         return "scalar inverse large"
+    if "fused_vector_legendre_forward_large_tma_batch2_kernel" in name:
+        return "vector forward large tma batch2"
+    if "fused_vector_legendre_forward_large_tma_kernel" in name:
+        return "vector forward large tma"
     if "fused_vector_legendre_forward_large_kernel" in name:
         return "vector forward large"
+    if "fused_vector_legendre_inverse_large_tma_kernel" in name:
+        return "vector inverse large tma"
     if "fused_vector_legendre_inverse_large_kernel" in name:
         return "vector inverse large"
+    if "fused_legendre_forward_real_large_tma_batch2_kernel" in name and "BFloat16" in name:
+        return "bf16 forward large tma batch2"
+    if "fused_legendre_forward_real_large_tma_kernel" in name and "BFloat16" in name:
+        return "bf16 forward large tma"
     if "fused_legendre_forward_real_large_kernel" in name and "BFloat16" in name:
         return "bf16 forward large"
+    if "fused_legendre_forward_real_tf32_kernel" in name:
+        return "scalar forward tf32 wmma"
     if "prepare_irfft_inplace" in name:
         return "prepare irfft"
     return name
+
+
+def resolve_binary(binary_arg: str) -> Path:
+    if binary_arg:
+        binary = Path(binary_arg)
+        if binary.exists():
+            return binary
+        raise FileNotFoundError(f"extension binary not found: {binary}")
+
+    candidates = [
+        Path("build/torch_extensions/holysht_ops_cuda.so"),
+        Path("build/torch_extensions/holysht_ops.so"),
+        Path("build/torch_extensions/holysht_ops_metal.so"),
+    ]
+    candidates.extend(sorted(Path("build/torch_extensions").glob("holysht_ops*.so")))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "could not find a HOLYSHT extension binary under build/torch_extensions; "
+        "pass --binary explicitly"
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Report HOLYSHT kernel resources")
     parser.add_argument(
         "--binary",
-        default="build/torch_extensions/holysht_ops.so",
-        help="Path to the compiled extension shared object.",
+        default="",
+        help="Path to the compiled extension shared object. Defaults to auto-discovery under build/torch_extensions.",
     )
     args = parser.parse_args()
 
     props = torch.cuda.get_device_properties(0)
-    kernels = parse_resources(Path(args.binary))
+    binary = resolve_binary(args.binary)
+    kernels = parse_resources(binary)
 
     interesting = [
         kernel for kernel in kernels
         if any(
             token in kernel.name
             for token in (
+                "fused_legendre_forward_large_tma_kernelILi8EE",
+                "fused_legendre_forward_large_tma_batch2_kernelILi8EE",
                 "fused_legendre_forward_large_kernelILi8EE",
+                "fused_legendre_inverse_large_tma_kernelILi8EE",
                 "fused_legendre_inverse_large_kernelILi8EE",
+                "fused_vector_legendre_forward_large_tma_kernelILi8EE",
+                "fused_vector_legendre_forward_large_tma_batch2_kernelILi8EE",
                 "fused_vector_legendre_forward_large_kernelILi8EE",
+                "fused_vector_legendre_inverse_large_tma_kernelILi8EE",
                 "fused_vector_legendre_inverse_large_kernelILi8EE",
+                "fused_legendre_forward_real_large_tma_kernelIN3c108BFloat16ELi8EE",
+                "fused_legendre_forward_real_large_tma_batch2_kernelIN3c108BFloat16ELi8EE",
                 "fused_legendre_forward_real_large_kernelIN3c108BFloat16ELi8EE",
+                "fused_legendre_forward_real_tf32_kernel",
                 "prepare_irfft_inplace",
             )
         )
     ]
 
     print(f"# resource summary for {props.name}")
+    print(f"# binary: {binary}")
     print()
     print("| Kernel | Regs/thread | Shared/block (bytes) | Block threads | Active blocks/SM | Theoretical occupancy |")
     print("|---|---:|---:|---:|---:|---:|")

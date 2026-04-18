@@ -10,6 +10,7 @@ Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -163,6 +164,15 @@ def test_autotune_uses_cached_winner(tmp_path, monkeypatch):
     )
 
     assert winner == "tc_tf32"
+
+
+@pytest.mark.cpu_ok
+def test_readme_covers_forward_only_autotune_policy():
+    readme = Path(os.path.join(os.path.dirname(__file__), "..", "README.md")).read_text()
+    assert "forward-only" in readme.lower()
+    assert "HOLYSHT_FORCE_BACKEND" in readme
+    assert "HOLYSHT_AUTOTUNE" in readme
+    assert "XDG_CACHE_HOME" in readme or "holysht_autotune_cache.json" in readme
 
 
 def test_public_tma_padding_uses_tile_aligned_m_quantum():
