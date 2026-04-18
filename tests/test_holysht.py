@@ -542,6 +542,98 @@ def test_forced_tensor_core_scalar_forward_matches_reference():
     assert (out - ref).abs().max().item() < COEFF_ATOL
 
 
+@pytest.mark.skipif(not HAS_CUDA or CUDA_MAJOR < 9, reason="SM90+ CUDA required")
+def test_forced_tensor_core_vector_forward_bf16_matches_reference(monkeypatch):
+    monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "tc_bf16")
+    torch.manual_seed(0)
+    ref = _to_test_device(RefRealVectorSHT(256, 512))
+    opt = _to_test_device(RealVectorSHT(256, 512, dtype="bf16"))
+    x = torch.randn(2, 2, 256, 512, device="cuda")
+
+    with torch.no_grad():
+        y_ref = ref(x)
+        y_opt = opt(x)
+
+    assert (y_opt - y_ref).abs().max().item() < COEFF_ATOL
+
+
+@pytest.mark.cpu_ok
+@pytest.mark.parametrize(
+    "op_kind,input_shape,weight_shape,padded_shape",
+    [
+        ("scalar-real-forward", (2, 4, 5), (8, 4, 5), (2, 4, 8)),
+        ("vector-real-forward", (4, 4, 5), (8, 4, 5), (4, 4, 8)),
+    ],
+)
+def test_autotuned_real_forward_routes_selected_tma_path(monkeypatch, op_kind, input_shape, weight_shape, padded_shape):
+    calls = []
+    selector_calls = []
+
+    def fake_select(key, candidates, benchmark, cache=None):
+        selector_calls.append((key, tuple(candidates)))
+        return "tma"
+
+    def fake_direct(input, weight_t, backend_hint=holysht._ForwardBackend.AUTO):
+        calls.append((tuple(input.shape), tuple(weight_t.shape), backend_hint))
+        return torch.zeros(input.size(0), weight_t.size(0), input.size(2), dtype=torch.float32)
+
+    monkeypatch.setattr(holysht, "_select_forward_backend_for_key", fake_select)
+    monkeypatch.setattr(holysht, "_direct_legendre_forward_real", fake_direct)
+
+    x = torch.randn(*input_shape)
+    weight_t = torch.randn(*weight_shape)
+    padded_x = torch.randn(*padded_shape)
+    padded_weight_t = torch.randn(weight_shape[0], weight_shape[1], padded_shape[-1])
+
+    out = holysht._autotuned_direct_legendre_forward_real(
+        x,
+        weight_t,
+        op_kind=op_kind,
+        dtype_mode="bf16",
+        backend_candidates=["fma", "tma", "tc_bf16"],
+        padded_input=padded_x,
+        padded_weight_t=padded_weight_t,
+        device_name="test-gpu",
+        capability="9.0",
+    )
+
+    assert selector_calls and selector_calls[0][1] == ("fma", "tma", "tc_bf16")
+    assert calls == [(tuple(padded_x.shape), tuple(padded_weight_t.shape), holysht._ForwardBackend.TMA)]
+    assert out.shape == (input_shape[0], weight_shape[0], padded_shape[-1])
+
+
+@pytest.mark.cpu_ok
+def test_autotuned_real_forward_uses_explicit_tc_bf16_fallback(monkeypatch):
+    calls = []
+
+    def fake_select(key, candidates, benchmark, cache=None):
+        assert tuple(candidates) == ("fma", "tma", "tc_bf16")
+        return "tc_bf16"
+
+    def fake_direct(input, weight_t, backend_hint=holysht._ForwardBackend.AUTO):
+        calls.append((tuple(input.shape), tuple(weight_t.shape), backend_hint))
+        return torch.zeros(input.size(0), weight_t.size(0), input.size(2), dtype=torch.float32)
+
+    monkeypatch.setattr(holysht, "_select_forward_backend_for_key", fake_select)
+    monkeypatch.setattr(holysht, "_direct_legendre_forward_real", fake_direct)
+
+    x = torch.randn(2, 4, 5)
+    weight_t = torch.randn(8, 4, 5)
+
+    out = holysht._autotuned_direct_legendre_forward_real(
+        x,
+        weight_t,
+        op_kind="scalar-real-forward",
+        dtype_mode="bf16",
+        backend_candidates=["fma", "tma", "tc_bf16"],
+        device_name="test-gpu",
+        capability="9.0",
+    )
+
+    assert calls == [(tuple(x.shape), tuple(weight_t.shape), holysht._ForwardBackend.TC_BF16)]
+    assert out.shape == (2, 8, 5)
+
+
 def test_direct_real_forward_uses_legacy_op_off_cuda(monkeypatch):
     calls = []
 
