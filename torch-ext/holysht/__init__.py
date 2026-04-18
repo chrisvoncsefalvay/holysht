@@ -435,12 +435,19 @@ def _direct_legendre_forward_complex(input: torch.Tensor, weight_t: torch.Tensor
     return output
 
 
-def _direct_legendre_forward_real(input: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
+def _direct_legendre_forward_real(
+    input: torch.Tensor,
+    weight_t: torch.Tensor,
+    backend_hint: _ForwardBackend = _ForwardBackend.AUTO,
+) -> torch.Tensor:
     output = torch.empty(
         input.size(0), weight_t.size(0), input.size(2),
         device=input.device, dtype=torch.float32
     )
-    _ops.fused_legendre_forward_real(output, input.contiguous(), weight_t)
+    if hasattr(_ops, "fused_legendre_forward_real_ex"):
+        _ops.fused_legendre_forward_real_ex(output, input.contiguous(), weight_t, int(backend_hint))
+    else:
+        _ops.fused_legendre_forward_real(output, input.contiguous(), weight_t)
     return output
 
 
@@ -448,12 +455,22 @@ def _direct_vector_legendre_forward(
     input: torch.Tensor,
     weight0_t: torch.Tensor,
     weight1_t: torch.Tensor,
+    backend_hint: _ForwardBackend = _ForwardBackend.AUTO,
 ) -> torch.Tensor:
     output = torch.empty(
         input.size(0), 2, weight0_t.size(0), input.size(3),
         device=input.device, dtype=torch.complex64
     )
-    _ops.fused_vector_legendre_forward(output, input.contiguous(), weight0_t, weight1_t)
+    if hasattr(_ops, "fused_vector_legendre_forward_ex"):
+        _ops.fused_vector_legendre_forward_ex(
+            output,
+            input.contiguous(),
+            weight0_t,
+            weight1_t,
+            int(backend_hint),
+        )
+    else:
+        _ops.fused_vector_legendre_forward(output, input.contiguous(), weight0_t, weight1_t)
     return output
 
 
