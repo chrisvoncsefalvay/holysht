@@ -167,6 +167,37 @@ def test_autotune_uses_cached_winner(tmp_path, monkeypatch):
 
 
 @pytest.mark.cpu_ok
+@pytest.mark.parametrize(
+    ("candidates", "expected"),
+    [
+        (["fma", "tma", "tc_tf32"], "tma"),
+        (["fma", "tc_tf32"], "fma"),
+    ],
+)
+def test_autotune_disabled_uses_deterministic_fallback(monkeypatch, candidates, expected):
+    monkeypatch.delenv("HOLYSHT_FORCE_BACKEND", raising=False)
+    monkeypatch.setenv("HOLYSHT_AUTOTUNE", "0")
+    key = holysht._AutotuneKey(
+        device_name="test-gpu",
+        capability="9.0",
+        op_kind="scalar-real-forward",
+        dtype_mode="fp32",
+        nlat=256,
+        lmax=256,
+        mmax=257,
+        batch_bucket="3-4",
+    )
+
+    winner = holysht._select_forward_backend_for_key(
+        key,
+        candidates=candidates,
+        benchmark=lambda name: (_ for _ in ()).throw(AssertionError("benchmark should not run")),
+    )
+
+    assert winner == expected
+
+
+@pytest.mark.cpu_ok
 def test_readme_covers_forward_only_autotune_policy():
     readme = Path(os.path.join(os.path.dirname(__file__), "..", "README.md")).read_text()
     assert "forward-only" in readme.lower()

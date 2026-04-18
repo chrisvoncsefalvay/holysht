@@ -263,6 +263,22 @@ def _forced_cuda_forward_backend() -> _ForwardBackend:
     return mapping.get(raw, _ForwardBackend.AUTO)
 
 
+def _autotune_enabled() -> bool:
+    raw = os.environ.get("HOLYSHT_AUTOTUNE", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _deterministic_forward_backend(candidates: list[str]) -> str:
+    for preferred in ("tma", "fma"):
+        if preferred in candidates:
+            return preferred
+    if not candidates:
+        raise ValueError("candidates must not be empty")
+    return candidates[0]
+
+
 def _select_forward_backend_for_key(
     key: _AutotuneKey,
     candidates: list[str],
@@ -278,6 +294,9 @@ def _select_forward_backend_for_key(
     }.get(forced)
     if forced_name in candidates:
         return forced_name
+
+    if not _autotune_enabled():
+        return _deterministic_forward_backend(candidates)
 
     cache = cache or _AutotuneCache(
         Path(os.environ.get("HOLYSHT_AUTOTUNE_CACHE_PATH", _default_autotune_cache_path()))

@@ -108,10 +108,13 @@ The project ships a lightweight profiling path that avoids the heavyweight
 - `HOLYSHT_FORCE_BACKEND` can be set to `fma`, `tma`, `tc_tf32`, or
   `tc_bf16`. The benchmark runner and module forwards surface the selected
   backend in logs when this is set.
-- `HOLYSHT_AUTOTUNE=1` enables the forward backend selector. Results are cached
-  in `~/.cache/holysht/holysht_autotune_cache.json` by default, or at the path
-  named by `HOLYSHT_AUTOTUNE_CACHE_PATH`. `XDG_CACHE_HOME` shifts that default
-  user cache root.
+- `HOLYSHT_AUTOTUNE` is enabled by default. When it is unset or truthy, forward
+  backend choices are cached in `~/.cache/holysht/holysht_autotune_cache.json`
+  by default, or at the path named by `HOLYSHT_AUTOTUNE_CACHE_PATH`.
+  `XDG_CACHE_HOME` shifts that default user cache root. Set
+  `HOLYSHT_AUTOTUNE=0|false|no|off` to skip cache and benchmark autotuning and
+  use a deterministic preference order instead (`tma`, then `fma`, then the
+  first available candidate).
 - `scripts/profile_nsys.sh` profiles the scalar forward case with `nsys`.
 - `scripts/profile_ncu.sh` attempts `ncu`; if GPU counters are unavailable for
   the current user it falls back to `scripts/report_resources.py`.
