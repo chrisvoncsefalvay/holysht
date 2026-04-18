@@ -24,19 +24,35 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
     ops.impl("fused_legendre_forward", torch::kCUDA, &fused_legendre_forward);
     ops.impl("fused_legendre_inverse", torch::kCUDA, &fused_legendre_inverse);
-    ops.impl("fused_legendre_forward_real", torch::kCUDA, &fused_legendre_forward_real);
+    ops.impl(
+        "fused_legendre_forward_real",
+        torch::kCUDA,
+        static_cast<void (*)(torch::Tensor&, const torch::Tensor&, const torch::Tensor&)>(&fused_legendre_forward_real)
+    );
     ops.impl("fused_legendre_forward_real_ex", torch::kCUDA, &fused_legendre_forward_real_ex);
     ops.impl("fused_legendre_inverse_real", torch::kCUDA, &fused_legendre_inverse_real);
-    ops.impl("fused_vector_legendre_forward", torch::kCUDA, &fused_vector_legendre_forward);
+    ops.impl(
+        "fused_vector_legendre_forward",
+        torch::kCUDA,
+        static_cast<void (*)(torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor&)>(&fused_vector_legendre_forward)
+    );
     ops.impl("fused_vector_legendre_forward_ex", torch::kCUDA, &fused_vector_legendre_forward_ex);
     ops.impl("fused_vector_legendre_inverse", torch::kCUDA, &fused_vector_legendre_inverse);
     ops.impl("sht_prepare_irfft", torch::kCUDA, &sht_prepare_irfft);
 #elif defined(METAL_KERNEL)
     ops.impl("fused_legendre_forward", torch::kMPS, &fused_legendre_forward);
     ops.impl("fused_legendre_inverse", torch::kMPS, &fused_legendre_inverse);
-    ops.impl("fused_legendre_forward_real", torch::kMPS, &fused_legendre_forward_real);
+    ops.impl(
+        "fused_legendre_forward_real",
+        torch::kMPS,
+        static_cast<void (*)(torch::Tensor&, const torch::Tensor&, const torch::Tensor&)>(&fused_legendre_forward_real)
+    );
     ops.impl("fused_legendre_inverse_real", torch::kMPS, &fused_legendre_inverse_real);
-    ops.impl("fused_vector_legendre_forward", torch::kMPS, &fused_vector_legendre_forward);
+    ops.impl(
+        "fused_vector_legendre_forward",
+        torch::kMPS,
+        static_cast<void (*)(torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor&)>(&fused_vector_legendre_forward)
+    );
     ops.impl("fused_vector_legendre_inverse", torch::kMPS, &fused_vector_legendre_inverse);
     ops.impl("sht_prepare_irfft", torch::kMPS, &sht_prepare_irfft);
 #endif
@@ -48,8 +64,12 @@ void fused_legendre_forward_real_ex(
     const torch::Tensor& weight_t,
     const int64_t backend_hint
 ) {
+#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
+    fused_legendre_forward_real(output, input, weight_t, backend_hint);
+#else
     (void)backend_hint;
     fused_legendre_forward_real(output, input, weight_t);
+#endif
 }
 
 void fused_vector_legendre_forward_ex(
@@ -59,8 +79,12 @@ void fused_vector_legendre_forward_ex(
     const torch::Tensor& weight1_t,
     const int64_t backend_hint
 ) {
+#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
+    fused_vector_legendre_forward(output, input, weight0_t, weight1_t, backend_hint);
+#else
     (void)backend_hint;
     fused_vector_legendre_forward(output, input, weight0_t, weight1_t);
+#endif
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

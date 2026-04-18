@@ -116,6 +116,55 @@ def test_force_backend_env_parser_accepts_known_values(monkeypatch):
     assert holysht._forced_cuda_forward_backend() == holysht._ForwardBackend.AUTO
 
 
+@pytest.mark.cpu_ok
+def test_autotune_prefers_forced_backend(monkeypatch):
+    monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "tma")
+    key = holysht._AutotuneKey(
+        device_name="test-gpu",
+        capability="9.0",
+        op_kind="scalar-real-forward",
+        dtype_mode="fp32",
+        nlat=256,
+        lmax=256,
+        mmax=257,
+        batch_bucket="3-4",
+    )
+
+    winner = holysht._select_forward_backend_for_key(
+        key,
+        candidates=["fma", "tma", "tc_tf32"],
+        benchmark=lambda name: {"fma": 3.0, "tma": 2.0, "tc_tf32": 1.0}[name],
+    )
+
+    assert winner == "tma"
+
+
+@pytest.mark.cpu_ok
+def test_autotune_uses_cached_winner(tmp_path, monkeypatch):
+    monkeypatch.delenv("HOLYSHT_FORCE_BACKEND", raising=False)
+    cache = holysht._AutotuneCache(tmp_path / "cache.json")
+    key = holysht._AutotuneKey(
+        device_name="test-gpu",
+        capability="9.0",
+        op_kind="scalar-real-forward",
+        dtype_mode="fp32",
+        nlat=256,
+        lmax=256,
+        mmax=257,
+        batch_bucket="3-4",
+    )
+    cache.store(key, "tc_tf32")
+
+    winner = holysht._select_forward_backend_for_key(
+        key,
+        candidates=["fma", "tma", "tc_tf32"],
+        benchmark=lambda name: (_ for _ in ()).throw(AssertionError("benchmark should not run")),
+        cache=cache,
+    )
+
+    assert winner == "tc_tf32"
+
+
 def test_public_tma_padding_uses_tile_aligned_m_quantum():
     scalar_fp32 = RealSHT(256, 512)
     scalar_bf16 = RealSHT(256, 512, dtype="bf16")

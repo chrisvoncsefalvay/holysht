@@ -262,6 +262,35 @@ def _forced_cuda_forward_backend() -> _ForwardBackend:
     return mapping.get(raw, _ForwardBackend.AUTO)
 
 
+def _select_forward_backend_for_key(
+    key: _AutotuneKey,
+    candidates: list[str],
+    benchmark,
+    cache: Optional[_AutotuneCache] = None,
+) -> str:
+    forced = _forced_cuda_forward_backend()
+    forced_name = {
+        _ForwardBackend.FMA: "fma",
+        _ForwardBackend.TMA: "tma",
+        _ForwardBackend.TC_TF32: "tc_tf32",
+        _ForwardBackend.TC_BF16: "tc_bf16",
+    }.get(forced)
+    if forced_name in candidates:
+        return forced_name
+
+    cache = cache or _AutotuneCache(
+        Path(os.environ.get("HOLYSHT_AUTOTUNE_CACHE_PATH", _default_autotune_cache_path()))
+    )
+    if os.environ.get("HOLYSHT_AUTOTUNE_REBENCH", "0") != "1":
+        cached = cache.load(key)
+        if cached in candidates:
+            return cached
+
+    winner = min(candidates, key=benchmark)
+    cache.store(key, winner)
+    return winner
+
+
 def _mps_scalar_fallback_chunk_m(weight: Optional[torch.Tensor], inverse: bool) -> int:
     if weight is None or weight.device.type != "mps":
         return 0
