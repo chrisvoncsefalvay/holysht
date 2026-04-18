@@ -1146,7 +1146,7 @@ class RealVectorSHT(nn.Module):
             x = x[..., :mmax].contiguous()
 
             if _HAS_NATIVE_EXT and x.is_cuda and not x.requires_grad and not self._use_bf16 and not self._use_fp16:
-                B_shape = x.shape[:-3]
+                leading_shape = x.shape[:-3]
                 x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
                 x = torch.view_as_real(x_flat)
 
@@ -1155,7 +1155,6 @@ class RealVectorSHT(nn.Module):
                 x10 = x[..., 1, :, :, 0]
                 x11 = x[..., 1, :, :, 1]
 
-                B_shape = x00.shape[:-2]
                 x00_flat = x00.reshape(-1, self.nlat, mmax)
                 x01_flat = x01.reshape(-1, self.nlat, mmax)
                 x10_flat = x10.reshape(-1, self.nlat, mmax)
@@ -1192,7 +1191,7 @@ class RealVectorSHT(nn.Module):
                 )[..., :mmax]
                 s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
             elif (not self._use_bf16 and not self._use_fp16) and (_can_use_cuda_vector(x, self.w0_t, self.w1_t) or _can_use_metal_vector(x, self.w0_t, self.w1_t)):
-                B_shape = x.shape[:-3]
+                leading_shape = x.shape[:-3]
                 x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
                 if (
                     x_flat.is_cuda
@@ -1205,9 +1204,9 @@ class RealVectorSHT(nn.Module):
                         self.w0_t_tma_complex,
                         self.w1_t_tma_complex,
                     )[..., :mmax]
-                    return out.reshape(B_shape + (2, self.lmax, mmax))
+                    return out.reshape(leading_shape + (2, self.lmax, mmax))
                 out = _FusedVectorLegendreForwardFn.apply(x_flat, self.w0_t, self.w1_t)
-                return out.reshape(B_shape + (2, self.lmax, mmax))
+                return out.reshape(leading_shape + (2, self.lmax, mmax))
 
             x = torch.view_as_real(x)  # [..., 2, nlat, mmax, 2]
 
@@ -1216,7 +1215,7 @@ class RealVectorSHT(nn.Module):
             x10 = x[..., 1, :, :, 0]
             x11 = x[..., 1, :, :, 1]
 
-            B_shape = x00.shape[:-2]
+            leading_shape = x00.shape[:-2]
             x00_flat = x00.reshape(-1, self.nlat, mmax)
             x01_flat = x01.reshape(-1, self.nlat, mmax)
             x10_flat = x10.reshape(-1, self.nlat, mmax)
@@ -1296,12 +1295,12 @@ class RealVectorSHT(nn.Module):
             tor_re = -s01 - r10
             tor_im = s00 - r11
 
-            out_shape = list(B_shape) + [2, self.lmax, mmax, 2]
+            out_shape = list(leading_shape) + [2, self.lmax, mmax, 2]
             xout = torch.empty(out_shape, dtype=x.dtype, device=x.device)
-            xout[..., 0, :, :, 0] = sph_re.reshape(B_shape + (self.lmax, mmax))
-            xout[..., 0, :, :, 1] = sph_im.reshape(B_shape + (self.lmax, mmax))
-            xout[..., 1, :, :, 0] = tor_re.reshape(B_shape + (self.lmax, mmax))
-            xout[..., 1, :, :, 1] = tor_im.reshape(B_shape + (self.lmax, mmax))
+            xout[..., 0, :, :, 0] = sph_re.reshape(leading_shape + (self.lmax, mmax))
+            xout[..., 0, :, :, 1] = sph_im.reshape(leading_shape + (self.lmax, mmax))
+            xout[..., 1, :, :, 0] = tor_re.reshape(leading_shape + (self.lmax, mmax))
+            xout[..., 1, :, :, 1] = tor_im.reshape(leading_shape + (self.lmax, mmax))
             return torch.view_as_complex(xout)
 
 
