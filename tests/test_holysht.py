@@ -543,6 +543,38 @@ def test_forced_tensor_core_scalar_forward_matches_reference():
 
 
 @pytest.mark.skipif(not HAS_CUDA or CUDA_MAJOR < 9, reason="SM90+ CUDA required")
+def test_forced_tensor_core_scalar_module_forward_matches_reference(monkeypatch):
+    monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "tc_tf32")
+    torch.manual_seed(0)
+    ref = _to_test_device(RefRealSHT(256, 512))
+    opt = _to_test_device(RealSHT(256, 512))
+    x = torch.randn(16, 256, 512, device="cuda")
+
+    with torch.no_grad():
+        y_ref = ref(x)
+        y_opt = opt(x)
+
+    assert y_opt.shape == y_ref.shape
+    assert (y_opt - y_ref).abs().max().item() < COEFF_ATOL
+
+
+@pytest.mark.skipif(not HAS_CUDA or CUDA_MAJOR < 9, reason="SM90+ CUDA required")
+def test_forced_tensor_core_vector_forward_matches_reference(monkeypatch):
+    monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "tc_tf32")
+    torch.manual_seed(0)
+    ref = _to_test_device(RefRealVectorSHT(256, 512))
+    opt = _to_test_device(RealVectorSHT(256, 512))
+    x = torch.randn(16, 2, 256, 512, device="cuda")
+
+    with torch.no_grad():
+        y_ref = ref(x)
+        y_opt = opt(x)
+
+    assert y_opt.shape == y_ref.shape
+    assert (y_opt - y_ref).abs().max().item() < COEFF_ATOL
+
+
+@pytest.mark.skipif(not HAS_CUDA or CUDA_MAJOR < 9, reason="SM90+ CUDA required")
 def test_forced_tensor_core_vector_forward_bf16_matches_reference(monkeypatch):
     monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "tc_bf16")
     torch.manual_seed(0)

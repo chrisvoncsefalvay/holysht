@@ -975,6 +975,37 @@ class RealSHT(nn.Module):
                 xs = torch.cat([xr[..., 0], xr[..., 1]], dim=0).half()
                 out = torch.einsum("bkm,mlk->blm", xs, self.weights).float()
                 return torch.complex(out[:B], out[B:])
+        if _HAS_NATIVE_EXT and x.is_cuda and not x.requires_grad:
+            with _nvtx_range("holysht.scalar_forward_fp32_autotune"):
+                x_fft = 2.0 * torch.pi * torch.fft.rfft(x, dim=-1, norm="forward")
+                x_fft = x_fft[..., :self.mmax]
+                xr = torch.view_as_real(x_fft)
+                tma_pad_input_re = None
+                tma_pad_input_im = None
+                tma_pad_weight = None
+                if _cuda_tma_available(x) and self._tma_mmax_real != self.mmax:
+                    tma_pad_input_re = _pad_last_dim(xr[..., 0].contiguous(), self._tma_mmax_real)
+                    tma_pad_input_im = _pad_last_dim(xr[..., 1].contiguous(), self._tma_mmax_real)
+                    tma_pad_weight = self.weight_t_tma_real
+                out_re = _autotuned_direct_legendre_forward_real(
+                    xr[..., 0].contiguous(),
+                    self.weight_t,
+                    op_kind="scalar-real-forward",
+                    dtype_mode="fp32",
+                    backend_candidates=["fma", "tma", "tc_tf32"],
+                    padded_input=tma_pad_input_re,
+                    padded_weight_t=tma_pad_weight,
+                )[..., :self.mmax]
+                out_im = _autotuned_direct_legendre_forward_real(
+                    xr[..., 1].contiguous(),
+                    self.weight_t,
+                    op_kind="scalar-real-forward",
+                    dtype_mode="fp32",
+                    backend_candidates=["fma", "tma", "tc_tf32"],
+                    padded_input=tma_pad_input_im,
+                    padded_weight_t=tma_pad_weight,
+                )[..., :self.mmax]
+                return torch.complex(out_re, out_im)
         if (
             _HAS_NATIVE_EXT
             and x.is_cuda
@@ -1114,7 +1145,53 @@ class RealVectorSHT(nn.Module):
             mmax = self.mmax
             x = x[..., :mmax].contiguous()
 
-            if (not self._use_bf16 and not self._use_fp16) and (_can_use_cuda_vector(x, self.w0_t, self.w1_t) or _can_use_metal_vector(x, self.w0_t, self.w1_t)):
+            if _HAS_NATIVE_EXT and x.is_cuda and not x.requires_grad and not self._use_bf16 and not self._use_fp16:
+                B_shape = x.shape[:-3]
+                x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
+                x = torch.view_as_real(x_flat)
+
+                x00 = x[..., 0, :, :, 0]
+                x01 = x[..., 0, :, :, 1]
+                x10 = x[..., 1, :, :, 0]
+                x11 = x[..., 1, :, :, 1]
+
+                B_shape = x00.shape[:-2]
+                x00_flat = x00.reshape(-1, self.nlat, mmax)
+                x01_flat = x01.reshape(-1, self.nlat, mmax)
+                x10_flat = x10.reshape(-1, self.nlat, mmax)
+                x11_flat = x11.reshape(-1, self.nlat, mmax)
+                B = x00_flat.shape[0]
+
+                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).contiguous()
+                tma_pad_w0 = None
+                if _cuda_tma_available(stacked_w0) and self._tma_mmax_real != mmax:
+                    tma_pad_w0 = _pad_last_dim(stacked_w0, self._tma_mmax_real)
+                out_w0 = _autotuned_direct_legendre_forward_real(
+                    stacked_w0,
+                    self.w0_t,
+                    op_kind="vector-real-forward",
+                    dtype_mode="fp32",
+                    backend_candidates=["fma", "tma", "tc_tf32"],
+                    padded_input=tma_pad_w0,
+                    padded_weight_t=self.w0_t_tma_real if tma_pad_w0 is not None else None,
+                )[..., :mmax]
+                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
+
+                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).contiguous()
+                tma_pad_w1 = None
+                if _cuda_tma_available(stacked_w1) and self._tma_mmax_real != mmax:
+                    tma_pad_w1 = _pad_last_dim(stacked_w1, self._tma_mmax_real)
+                out_w1 = _autotuned_direct_legendre_forward_real(
+                    stacked_w1,
+                    self.w1_t,
+                    op_kind="vector-real-forward",
+                    dtype_mode="fp32",
+                    backend_candidates=["fma", "tma", "tc_tf32"],
+                    padded_input=tma_pad_w1,
+                    padded_weight_t=self.w1_t_tma_real if tma_pad_w1 is not None else None,
+                )[..., :mmax]
+                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
+            elif (not self._use_bf16 and not self._use_fp16) and (_can_use_cuda_vector(x, self.w0_t, self.w1_t) or _can_use_metal_vector(x, self.w0_t, self.w1_t)):
                 B_shape = x.shape[:-3]
                 x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
                 if (
