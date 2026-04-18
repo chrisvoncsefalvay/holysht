@@ -529,7 +529,7 @@ def test_direct_vector_forward_accepts_backend_hint():
 def test_forced_tensor_core_scalar_forward_matches_reference():
     torch.manual_seed(0)
     weight_t = torch.randn(256, 256, 257, device="cuda")
-    x = torch.randn(2, 256, 257, device="cuda")
+    x = torch.randn(16, 256, 257, device="cuda")
 
     out = holysht._direct_legendre_forward_real(
         x,

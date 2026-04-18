@@ -640,11 +640,11 @@ __global__ void fused_legendre_forward_real_tf32_kernel(
     namespace wmma = nvcuda::wmma;
 
     const int lane = threadIdx.x;
-    const int m0 = blockIdx.x * 16;
+    const int m = blockIdx.x;
     const int l0 = blockIdx.y * 16;
-    const int b = blockIdx.z;
+    const int b0 = blockIdx.z * 16;
 
-    if (b >= batch_size || lane >= 32) {
+    if (m >= mmax || lane >= 32) {
         return;
     }
 
@@ -652,62 +652,58 @@ __global__ void fused_legendre_forward_real_tf32_kernel(
     __shared__ alignas(16) float b_tile[8 * 16];
     __shared__ alignas(16) float c_tile[16 * 16];
 
-    const int input_batch_base = (int)b * nlat * mmax;
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
 
-    #pragma unroll
-    for (int m_off = 0; m_off < 16; ++m_off) {
-        const int m = m0 + m_off;
-        if (m >= mmax) {
-            continue;
-        }
-
-        wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 8, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-
-        for (int k0 = 0; k0 < nlat; k0 += 8) {
-            #pragma unroll
-            for (int idx = lane; idx < 16 * 8; idx += 32) {
-                const int row = idx / 8;
-                const int kk = idx % 8;
-                const int l = l0 + row;
-                const int k = k0 + kk;
-                float value = 0.0f;
-                if (l < lmax && k < nlat) {
-                    value = static_cast<float>(weight_t[(int)l * nlat * mmax + (int)k * mmax + m]);
-                }
-                a_tile[idx] = value;
-            }
-            #pragma unroll
-            for (int idx = lane; idx < 8 * 16; idx += 32) {
-                const int kk = idx % 8;
-                const int col = idx / 8;
-                const int k = k0 + kk;
-                float value = 0.0f;
-                if (k < nlat) {
-                    value = static_cast<float>(input[input_batch_base + (int)k * mmax + m]);
-                }
-                b_tile[col * 8 + kk] = value;
-            }
-
-            __syncthreads();
-            wmma::load_matrix_sync(a_frag, a_tile, 8);
-            wmma::load_matrix_sync(b_frag, b_tile, 8);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-            __syncthreads();
-        }
-
-        wmma::store_matrix_sync(c_tile, c_frag, 16, wmma::mem_row_major);
-        __syncthreads();
-
-        for (int row = lane; row < 16; row += 32) {
+    for (int k0 = 0; k0 < nlat; k0 += 8) {
+        #pragma unroll
+        for (int idx = lane; idx < 16 * 8; idx += 32) {
+            const int row = idx / 8;
+            const int kk = idx % 8;
             const int l = l0 + row;
-            if (l < lmax && m <= l) {
-                output[(int)b * lmax * mmax + (int)l * mmax + m] = c_tile[row * 16];
+            const int k = k0 + kk;
+            float value = 0.0f;
+            if (l < lmax && k < nlat) {
+                value = static_cast<float>(weight_t[(int)l * nlat * mmax + (int)k * mmax + m]);
+            }
+            a_tile[idx] = value;
+        }
+        #pragma unroll
+        for (int idx = lane; idx < 8 * 16; idx += 32) {
+            const int kk = idx % 8;
+            const int col = idx / 8;
+            const int k = k0 + kk;
+            const int b = b0 + col;
+            float value = 0.0f;
+            if (b < batch_size && k < nlat) {
+                value = static_cast<float>(input[(int)b * nlat * mmax + (int)k * mmax + m]);
+            }
+            b_tile[col * 8 + kk] = value;
+        }
+
+        __syncthreads();
+        wmma::load_matrix_sync(a_frag, a_tile, 8);
+        wmma::load_matrix_sync(b_frag, b_tile, 8);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(c_tile, c_frag, 16, wmma::mem_row_major);
+    __syncthreads();
+
+    for (int row = lane; row < 16; row += 32) {
+        const int l = l0 + row;
+        if (l < lmax && m <= l) {
+            #pragma unroll
+            for (int col = 0; col < 16; ++col) {
+                const int b = b0 + col;
+                if (b < batch_size) {
+                    output[(int)b * lmax * mmax + (int)l * mmax + m] = c_tile[row * 16 + col];
+                }
             }
         }
-        __syncthreads();
     }
 }
 
@@ -2448,12 +2444,13 @@ void launch_forward_real(
         );
         if (want_tf32_tc) {
             C10_CUDA_CHECK(cudaMemsetAsync(output.data_ptr(), 0, output.nbytes(), stream));
-            const int m_tiles = (mmax + 15) / 16;
+            const int m_tiles = mmax;
             const int l_tiles = (lmax + 15) / 16;
-            if (m_tiles == 0 || l_tiles == 0) {
+            const int batch_tiles = (batch_size + 15) / 16;
+            if (m_tiles == 0 || l_tiles == 0 || batch_tiles == 0) {
                 return;
             }
-            dim3 tc_grid(m_tiles, l_tiles, batch_size);
+            dim3 tc_grid(m_tiles, l_tiles, batch_tiles);
             dim3 tc_block(32, 1, 1);
             fused_legendre_forward_real_tf32_kernel<float><<<tc_grid, tc_block, 0, stream>>>(
                 input.data_ptr<float>(),
