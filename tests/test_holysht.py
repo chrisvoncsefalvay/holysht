@@ -525,6 +525,23 @@ def test_direct_vector_forward_accepts_backend_hint():
     assert out.shape == (2, 2, 32, 17)
 
 
+@pytest.mark.skipif(not HAS_CUDA or CUDA_MAJOR < 9, reason="SM90+ CUDA required")
+def test_forced_tensor_core_scalar_forward_matches_reference():
+    torch.manual_seed(0)
+    weight_t = torch.randn(256, 256, 257, device="cuda")
+    x = torch.randn(2, 256, 257, device="cuda")
+
+    out = holysht._direct_legendre_forward_real(
+        x,
+        weight_t,
+        backend_hint=holysht._ForwardBackend.TC_TF32,
+    )
+    ref = torch.einsum("bnm,lnm->blm", x, weight_t)
+
+    assert out.shape == ref.shape
+    assert (out - ref).abs().max().item() < COEFF_ATOL
+
+
 def test_direct_real_forward_uses_legacy_op_off_cuda(monkeypatch):
     calls = []
 

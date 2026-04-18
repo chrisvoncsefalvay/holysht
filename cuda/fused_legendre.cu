@@ -627,6 +627,85 @@ __global__ void fused_legendre_forward_real_large_kernel(
 
 template <typename scalar_t, int TILE_L>
 __launch_bounds__(TILE_M * TILE_L, 4)
+__global__ void fused_legendre_forward_real_large_tc_kernel(
+    const scalar_t* __restrict__ input,
+    const float* __restrict__ weight_t,
+    float* __restrict__ output,
+    const int batch_size,
+    const int nlat,
+    const int lmax,
+    const int mmax
+) {
+    const PackedForwardTile<TILE_L> tile = decode_packed_forward_tile<TILE_L>(blockIdx.x, lmax, mmax);
+    const int m = tile.m_tile * TILE_M + threadIdx.x;
+    const int l = tile.l_tile * TILE_L + threadIdx.y;
+    const int b = blockIdx.z;
+
+    const bool valid_out = (b < batch_size) && (l < lmax) && (m < mmax);
+    const bool active = valid_out && (tile.full_triangle || (m <= l));
+    const bool can_load = (b < batch_size) && (m < mmax);
+
+    __shared__ float sm_input[TILE_K][TILE_M + 1];
+
+    float acc = 0.0f;
+    const int in_base = (int)b * nlat * mmax + m;
+    const int w_base = (int)l * nlat * mmax + m;
+
+    // Tensor-core backend scaffold: same tiled contraction, with a dedicated
+    // launch target so future MMA accumulation can slot in without changing the
+    // Python or registration plumbing again.
+    #pragma unroll
+    for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+        const int row = pass * TILE_L + threadIdx.y;
+        if (can_load && row < nlat) {
+            sm_input[row][threadIdx.x] = cast_scalar(input[in_base + (int)row * mmax]);
+        } else {
+            sm_input[row][threadIdx.x] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    for (int k0 = 0; k0 < nlat; k0 += TILE_K) {
+        float prefetch[TILE_K / TILE_L];
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            const int next_k = k0 + TILE_K + row;
+            prefetch[pass] = (can_load && next_k < nlat)
+                ? cast_scalar(input[in_base + (int)next_k * mmax])
+                : 0.0f;
+        }
+
+        if (active) {
+            float w_reg[TILE_K];
+            #pragma unroll
+            for (int kk = 0; kk < TILE_K; ++kk) {
+                const int k_idx = k0 + kk;
+                w_reg[kk] = (k_idx < nlat) ? __ldg(&weight_t[w_base + (int)k_idx * mmax]) : 0.0f;
+            }
+            #pragma unroll
+            for (int kk = 0; kk < TILE_K; ++kk) {
+                acc = fmaf(w_reg[kk], sm_input[kk][threadIdx.x], acc);
+            }
+        }
+
+        __syncthreads();
+        #pragma unroll
+        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
+            const int row = pass * TILE_L + threadIdx.y;
+            sm_input[row][threadIdx.x] = prefetch[pass];
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        const int out_idx = (int)b * lmax * mmax + (int)l * mmax + m;
+        output[out_idx] = acc;
+    }
+}
+
+template <typename scalar_t, int TILE_L>
+__launch_bounds__(TILE_M * TILE_L, 4)
 __global__ void fused_legendre_inverse_real_kernel(
     const scalar_t* __restrict__ input,
     const float* __restrict__ weight_t,
@@ -2345,6 +2424,27 @@ void launch_forward_real(
 
     if (nlat <= effective_config.small_grid_threshold && lmax <= effective_config.small_grid_threshold) {
         fused_legendre_forward_real_kernel<scalar_t, TILE_L><<<rect_grid, block, 0, stream>>>(
+            input.data_ptr<scalar_t>(),
+            weight_t.data_ptr<float>(),
+            output.data_ptr<float>(),
+            batch_size, nlat, lmax, mmax
+        );
+        return;
+    }
+
+    const auto* props = at::cuda::getCurrentDeviceProperties();
+    const bool want_tc = (
+        backend_hint == ForwardBackendHint::TcTf32 ||
+        backend_hint == ForwardBackendHint::TcBf16
+    ) && props != nullptr && props->major >= 9;
+    if (want_tc) {
+        C10_CUDA_CHECK(cudaMemsetAsync(output.data_ptr(), 0, output.nbytes(), stream));
+        const int packed_tiles = packed_forward_tile_count<TILE_L>(lmax, mmax);
+        if (packed_tiles == 0) {
+            return;
+        }
+        dim3 packed_grid(packed_tiles, 1, batch_size);
+        fused_legendre_forward_real_large_tc_kernel<scalar_t, TILE_L><<<packed_grid, block, 0, stream>>>(
             input.data_ptr<scalar_t>(),
             weight_t.data_ptr<float>(),
             output.data_ptr<float>(),
