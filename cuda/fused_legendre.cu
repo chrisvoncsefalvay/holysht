@@ -8,6 +8,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <mma.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -625,9 +626,9 @@ __global__ void fused_legendre_forward_real_large_kernel(
     }
 }
 
-template <typename scalar_t, int TILE_L>
-__launch_bounds__(TILE_M * TILE_L, 4)
-__global__ void fused_legendre_forward_real_large_tc_kernel(
+template <typename scalar_t>
+__launch_bounds__(32, 1)
+__global__ void fused_legendre_forward_real_tf32_kernel(
     const scalar_t* __restrict__ input,
     const float* __restrict__ weight_t,
     float* __restrict__ output,
@@ -636,71 +637,77 @@ __global__ void fused_legendre_forward_real_large_tc_kernel(
     const int lmax,
     const int mmax
 ) {
-    const PackedForwardTile<TILE_L> tile = decode_packed_forward_tile<TILE_L>(blockIdx.x, lmax, mmax);
-    const int m = tile.m_tile * TILE_M + threadIdx.x;
-    const int l = tile.l_tile * TILE_L + threadIdx.y;
+    namespace wmma = nvcuda::wmma;
+
+    const int lane = threadIdx.x;
+    const int m0 = blockIdx.x * 16;
+    const int l0 = blockIdx.y * 16;
     const int b = blockIdx.z;
 
-    const bool valid_out = (b < batch_size) && (l < lmax) && (m < mmax);
-    const bool active = valid_out && (tile.full_triangle || (m <= l));
-    const bool can_load = (b < batch_size) && (m < mmax);
+    if (b >= batch_size || lane >= 32) {
+        return;
+    }
 
-    __shared__ float sm_input[TILE_K][TILE_M + 1];
+    __shared__ alignas(16) float a_tile[16 * 8];
+    __shared__ alignas(16) float b_tile[8 * 16];
+    __shared__ alignas(16) float c_tile[16 * 16];
 
-    float acc = 0.0f;
-    const int in_base = (int)b * nlat * mmax + m;
-    const int w_base = (int)l * nlat * mmax + m;
+    const int input_batch_base = (int)b * nlat * mmax;
 
-    // Tensor-core backend scaffold: same tiled contraction, with a dedicated
-    // launch target so future MMA accumulation can slot in without changing the
-    // Python or registration plumbing again.
     #pragma unroll
-    for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
-        const int row = pass * TILE_L + threadIdx.y;
-        if (can_load && row < nlat) {
-            sm_input[row][threadIdx.x] = cast_scalar(input[in_base + (int)row * mmax]);
-        } else {
-            sm_input[row][threadIdx.x] = 0.0f;
-        }
-    }
-    __syncthreads();
-
-    for (int k0 = 0; k0 < nlat; k0 += TILE_K) {
-        float prefetch[TILE_K / TILE_L];
-        #pragma unroll
-        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
-            const int row = pass * TILE_L + threadIdx.y;
-            const int next_k = k0 + TILE_K + row;
-            prefetch[pass] = (can_load && next_k < nlat)
-                ? cast_scalar(input[in_base + (int)next_k * mmax])
-                : 0.0f;
+    for (int m_off = 0; m_off < 16; ++m_off) {
+        const int m = m0 + m_off;
+        if (m >= mmax) {
+            continue;
         }
 
-        if (active) {
-            float w_reg[TILE_K];
+        wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 8, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+
+        for (int k0 = 0; k0 < nlat; k0 += 8) {
             #pragma unroll
-            for (int kk = 0; kk < TILE_K; ++kk) {
-                const int k_idx = k0 + kk;
-                w_reg[kk] = (k_idx < nlat) ? __ldg(&weight_t[w_base + (int)k_idx * mmax]) : 0.0f;
+            for (int idx = lane; idx < 16 * 8; idx += 32) {
+                const int row = idx / 8;
+                const int kk = idx % 8;
+                const int l = l0 + row;
+                const int k = k0 + kk;
+                float value = 0.0f;
+                if (l < lmax && k < nlat) {
+                    value = static_cast<float>(weight_t[(int)l * nlat * mmax + (int)k * mmax + m]);
+                }
+                a_tile[idx] = value;
             }
             #pragma unroll
-            for (int kk = 0; kk < TILE_K; ++kk) {
-                acc = fmaf(w_reg[kk], sm_input[kk][threadIdx.x], acc);
+            for (int idx = lane; idx < 8 * 16; idx += 32) {
+                const int kk = idx % 8;
+                const int col = idx / 8;
+                const int k = k0 + kk;
+                float value = 0.0f;
+                if (k < nlat) {
+                    value = static_cast<float>(input[input_batch_base + (int)k * mmax + m]);
+                }
+                b_tile[col * 8 + kk] = value;
+            }
+
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, 8);
+            wmma::load_matrix_sync(b_frag, b_tile, 8);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            __syncthreads();
+        }
+
+        wmma::store_matrix_sync(c_tile, c_frag, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        for (int row = lane; row < 16; row += 32) {
+            const int l = l0 + row;
+            if (l < lmax && m <= l) {
+                output[(int)b * lmax * mmax + (int)l * mmax + m] = c_tile[row * 16];
             }
         }
-
         __syncthreads();
-        #pragma unroll
-        for (int pass = 0; pass < TILE_K / TILE_L; ++pass) {
-            const int row = pass * TILE_L + threadIdx.y;
-            sm_input[row][threadIdx.x] = prefetch[pass];
-        }
-        __syncthreads();
-    }
-
-    if (active) {
-        const int out_idx = (int)b * lmax * mmax + (int)l * mmax + m;
-        output[out_idx] = acc;
     }
 }
 
@@ -2432,25 +2439,30 @@ void launch_forward_real(
         return;
     }
 
-    const auto* props = at::cuda::getCurrentDeviceProperties();
-    const bool want_tc = (
-        backend_hint == ForwardBackendHint::TcTf32 ||
-        backend_hint == ForwardBackendHint::TcBf16
-    ) && props != nullptr && props->major >= 9;
-    if (want_tc) {
-        C10_CUDA_CHECK(cudaMemsetAsync(output.data_ptr(), 0, output.nbytes(), stream));
-        const int packed_tiles = packed_forward_tile_count<TILE_L>(lmax, mmax);
-        if (packed_tiles == 0) {
+    if constexpr (std::is_same<scalar_t, float>::value) {
+        const auto* props = at::cuda::getCurrentDeviceProperties();
+        const bool want_tf32_tc = (
+            backend_hint == ForwardBackendHint::TcTf32 &&
+            props != nullptr &&
+            props->major >= 9
+        );
+        if (want_tf32_tc) {
+            C10_CUDA_CHECK(cudaMemsetAsync(output.data_ptr(), 0, output.nbytes(), stream));
+            const int m_tiles = (mmax + 15) / 16;
+            const int l_tiles = (lmax + 15) / 16;
+            if (m_tiles == 0 || l_tiles == 0) {
+                return;
+            }
+            dim3 tc_grid(m_tiles, l_tiles, batch_size);
+            dim3 tc_block(32, 1, 1);
+            fused_legendre_forward_real_tf32_kernel<float><<<tc_grid, tc_block, 0, stream>>>(
+                input.data_ptr<float>(),
+                weight_t.data_ptr<float>(),
+                output.data_ptr<float>(),
+                batch_size, nlat, lmax, mmax
+            );
             return;
         }
-        dim3 packed_grid(packed_tiles, 1, batch_size);
-        fused_legendre_forward_real_large_tc_kernel<scalar_t, TILE_L><<<packed_grid, block, 0, stream>>>(
-            input.data_ptr<scalar_t>(),
-            weight_t.data_ptr<float>(),
-            output.data_ptr<float>(),
-            batch_size, nlat, lmax, mmax
-        );
-        return;
     }
 
     C10_CUDA_CHECK(cudaMemsetAsync(output.data_ptr(), 0, output.nbytes(), stream));
