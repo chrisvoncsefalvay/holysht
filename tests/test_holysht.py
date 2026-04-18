@@ -9,6 +9,7 @@ Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -58,6 +59,44 @@ def test_aliases_are_available():
     assert holysht.FusedInverseRealSHT is holysht.InverseRealSHT
     assert holysht.FusedRealVectorSHT is holysht.RealVectorSHT
     assert holysht.FusedInverseRealVectorSHT is holysht.InverseRealVectorSHT
+
+
+def test_autotune_batch_bucket_is_stable():
+    assert holysht._autotune_batch_bucket(1) == "1"
+    assert holysht._autotune_batch_bucket(2) == "2"
+    assert holysht._autotune_batch_bucket(3) == "3-4"
+    assert holysht._autotune_batch_bucket(4) == "3-4"
+    assert holysht._autotune_batch_bucket(5) == "5+"
+
+
+def test_autotune_cache_roundtrip(tmp_path):
+    cache_path = tmp_path / "autotune.json"
+    cache = holysht._AutotuneCache(cache_path)
+    key = holysht._AutotuneKey(
+        device_name="test-gpu",
+        capability="9.0",
+        op_kind="scalar-real-forward",
+        dtype_mode="fp32",
+        nlat=256,
+        lmax=256,
+        mmax=257,
+        batch_bucket="3-4",
+    )
+    cache.store(key, "tc_tf32")
+
+    reloaded = holysht._AutotuneCache(cache_path)
+    assert reloaded.load(key) == "tc_tf32"
+
+
+def test_force_backend_env_parser_accepts_known_values(monkeypatch):
+    monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "tc_tf32")
+    assert holysht._forced_cuda_forward_backend() == holysht._ForwardBackend.TC_TF32
+
+    monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "tc_bf16")
+    assert holysht._forced_cuda_forward_backend() == holysht._ForwardBackend.TC_BF16
+
+    monkeypatch.setenv("HOLYSHT_FORCE_BACKEND", "bogus")
+    assert holysht._forced_cuda_forward_backend() == holysht._ForwardBackend.AUTO
 
 
 # ============================================================================

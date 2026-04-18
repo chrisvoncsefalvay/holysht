@@ -10,7 +10,11 @@ Hugging Face kernel: https://hf.co/chrisvoncsefalvay/holysht
 """
 
 import contextlib
+import json
 import os
+from dataclasses import dataclass, asdict
+from enum import IntEnum
+from pathlib import Path
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -25,6 +29,8 @@ __all__ = [
     "sht_forward",
     "sht_inverse",
 ]
+
+_ROOT = Path(__file__).resolve().parent
 
 # Prefer kernel-builder's generated alias module on packaged builds, then fall
 # back to the local single-machine JIT loader for development.
@@ -181,6 +187,74 @@ def _parse_nonnegative_int_env(name: str, default: int) -> int:
         return max(0, int(raw))
     except ValueError:
         return default
+
+class _ForwardBackend(IntEnum):
+    AUTO = 0
+    FMA = 1
+    TMA = 2
+    TC_TF32 = 3
+    TC_BF16 = 4
+
+
+@dataclass(frozen=True)
+class _AutotuneKey:
+    device_name: str
+    capability: str
+    op_kind: str
+    dtype_mode: str
+    nlat: int
+    lmax: int
+    mmax: int
+    batch_bucket: str
+
+
+def _autotune_batch_bucket(batch_size: int) -> str:
+    if batch_size <= 1:
+        return "1"
+    if batch_size == 2:
+        return "2"
+    if batch_size <= 4:
+        return "3-4"
+    return "5+"
+
+
+def _default_autotune_cache_path() -> Path:
+    return _ROOT / "build" / "holysht_autotune_cache.json"
+
+
+class _AutotuneCache:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _read(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {}
+        try:
+            return json.loads(self.path.read_text())
+        except Exception:
+            return {}
+
+    def load(self, key: _AutotuneKey) -> Optional[str]:
+        return self._read().get(json.dumps(asdict(key), sort_keys=True))
+
+    def store(self, key: _AutotuneKey, backend_name: str) -> None:
+        payload = self._read()
+        payload[json.dumps(asdict(key), sort_keys=True)] = backend_name
+        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _forced_cuda_forward_backend() -> _ForwardBackend:
+    raw = os.environ.get("HOLYSHT_FORCE_BACKEND", "").strip().lower()
+    mapping = {
+        "": _ForwardBackend.AUTO,
+        "auto": _ForwardBackend.AUTO,
+        "fma": _ForwardBackend.FMA,
+        "tma": _ForwardBackend.TMA,
+        "tc_tf32": _ForwardBackend.TC_TF32,
+        "tc_bf16": _ForwardBackend.TC_BF16,
+    }
+    return mapping.get(raw, _ForwardBackend.AUTO)
 
 
 def _mps_scalar_fallback_chunk_m(weight: Optional[torch.Tensor], inverse: bool) -> int:
