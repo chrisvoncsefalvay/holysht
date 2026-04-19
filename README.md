@@ -18,6 +18,14 @@ reimplementation. HOLYSHT still reuses `torch-harmonics` to generate quadrature
 weights, then replaces the slowest execution paths with backend-specific code
 tuned for the current target.
 
+> Note. HOLYSHT is a prod-ready kernel running in prod in many places. This is 
+> despite the fact that I am documenting the process here as we go along. I think
+> more developers should document their attempts to improve their code, especially
+> in low level programming, where sometimes there's a temptation to insist on an 
+> air of effortless wizardry. No good kernel code is effortless. It's dead ends, 
+> hours of work for another 0.1% performance and sometimes a real slog. And that's
+> the beauty of it. We shouldn't be ashamed of that.
+
 <p align="center">
   <img src="examples/mars_weather.gif" alt="Martian weather simulation using HOLYSHT — spectral advection on a 256×512 grid with real MOLA topography" width="800">
   <br>
@@ -47,7 +55,7 @@ tuned for the current target.
 
 ## Performance
 
-Forward benchmarks were rerun on April 18, 2026 on an NVIDIA GB10 with
+Forward benchmarks were run on an NVIDIA GB10 with
 PyTorch `2.10.0+cu130`, CUDA `13.0`, batch size `4`, and
 
 ```bash
@@ -103,8 +111,9 @@ TMA itself only needs 16-byte alignment, but the current forward microkernels
 still prefer 8-wide `m` tiles, so the complex public path intentionally keeps
 the wider pad.
 
-The non-CUDA benchmark suite was also rerun on April 18, 2026 on this Apple
-Silicon machine with PyTorch `2.11.0`, Apple Metal/MPS, batch size `4`, and
+## On Metal/MPS
+
+The non-CUDA benchmark suite was run on an M4 Mini with PyTorch `2.11.0`, Apple Metal/MPS, batch size `4`, and
 
 ```bash
 PYTHONPATH=torch-ext .venv/bin/python benchmarks/bench_torch_harmonics.py \
@@ -115,9 +124,7 @@ PYTHONPATH=torch-ext .venv/bin/python benchmarks/bench_torch_harmonics.py \
   --output data/bench_torch_harmonics_mps.json
 ```
 
-That Apple-safe run excludes the CUDA-only BF16/tensor-core scenarios. All
-`18/18` MPS checks passed with a mean speedup of **1.4x**. The measured result
-is not "MPS is uniformly faster"; it is more specific than that:
+In short:
 
 - vector forward and inverse are consistently faster, including the largest
   tested `512x1024` cases
@@ -146,9 +153,8 @@ The best Apple wins in this run were the vector paths:
 - `RealVectorSHT.forward+backward 256x512`: **1.70x**
 
 The full structured results for this box are in
-`data/bench_torch_harmonics_mps.json`, and `data/bench_torch_harmonics.json`
-was refreshed from the same run so the local benchmark artifact is no longer a
-stale one-case MPS sample.
+`data/bench_torch_harmonics_mps.json`, and `data/bench_torch_harmonics.json`.
+
 
 
 ## Profiling and resources
@@ -330,8 +336,6 @@ python3 scripts/report_resources.py
 ```bash
 PYTHONPATH=torch-ext pytest tests/test_holysht.py
 ```
-
-## Author
 
 ## Author
 
