@@ -1733,7 +1733,7 @@ __device__ inline void tma_load_3d(
         cuda::device::barrier_expect_tx(bar, expected_bytes);
         const int32_t coords[3] = {coord0, coord1, coord2};
         cuda::ptx::cp_async_bulk_tensor(
-            cuda::ptx::space_shared, cuda::ptx::space_global,
+            cuda::ptx::space_cluster, cuda::ptx::space_global,
             smem_dst, &tma_map, coords,
             reinterpret_cast<uint64_t*>(cuda::device::barrier_native_handle(bar))
         );
