@@ -6,7 +6,7 @@
 
 [general]
 name = "holysht"
-version = 1
+version = "0.8.0"
 license = "mit"
 upstream = "https://github.com/NVIDIA/torch-harmonics"
 backends = ["cuda", "metal"]
