@@ -2,74 +2,88 @@
 
 ## Summary
 
-HOLYSHT is a focused CUDA acceleration layer for spherical harmonic transforms
-in the `torch-harmonics` ecosystem. It accelerates the Legendre stage, vector
-SHT composition, and inverse-FFT preparation rather than replacing the whole
-upstream library. For more information, [check the repo](https://github.com/chrisvoncsefalvay/holysht).
+HOLYSHT is a production-ready GPU acceleration layer for spherical harmonic transforms (SHT) in the `torch-harmonics` ecosystem. It provides high-performance CUDA kernels for NVIDIA GPUs (Hopper/Blackwell with TMA support) and Apple Metal/MPS kernels for arm64 Macs. Rather than reimplementing `torch-harmonics`, HOLYSHT focuses on accelerating the slowest execution paths—Legendre stage computation, vector SHT composition, and inverse-FFT preparation—via backend-specific kernels. It reuses `torch-harmonics` for quadrature weight generation and remains an intentional companion library rather than a full replacement.
 
-## Scope
+The project is production-proven, documented-in-progress, and includes comprehensive profiling, benchmarking, and parity-testing infrastructure suitable for low-level kernel development.
 
-Included:
+## What's included
 
-- Scalar forward SHT
-- Scalar inverse SHT
-- Vector forward SHT
-- Vector inverse SHT
-- Explicit backward support for the custom scalar and vector kernels
-- BF16 forward paths backed by CUDA real-reduction kernels
-- Benchmark, profiling, and parity-test tooling
+**Core transforms:**
+- `RealSHT`, `InverseRealSHT` (scalar forward/inverse)
+- `RealVectorSHT`, `InverseRealVectorSHT` (vector forward/inverse)
+- Explicit backward (autograd) support for all custom CUDA paths
+- Mixed-precision (BF16) forward paths via CUDA real-reduction kernels
 
+**Kernels and backends:**
+- CUDA: Hopper/Blackwell TMA kernels, tensor-core variants (TF32, BF16), FMA kernels, shared-memory large-grid designs
+- Metal/MPS: Native Metal compute kernels for Apple Silicon, with hybrid dispatch strategies (native kernel for small grids, fallback einsum for larger grids, tuned mid-size ranges)
+- Runtime architecture-aware launch selection and backend autotuning via configurable environment variables
 
-## Benchmark summary
+**Infrastructure:**
+- Full benchmark suite (forward, inverse, BF16, training paths)
+- Profiling helpers for `nsys`, `ncu`, and `cuobjdump` resource reporting
+- Parity tests against `torch-harmonics` covering backward and non-contiguous inputs
+- Local torch JIT build caching for safe day-to-day development iteration
 
-Measured with PyTorch `2.10.0+cu130`, CUDA `13.0`, batch size
-`4`, an allocation cap of `6 GiB`, and an NVIDIA GB10:
+## Performance summary
 
-- Scalar forward: up to `4.6x`
-- Scalar inverse: up to `2.0x`
-- Vector forward: up to `8.7x`
-- Vector inverse: up to `8.7x`
-- Scalar forward + backward: `2.3x`
-- Vector forward + backward: `4.3x`
-- BF16 scalar forward: `1.6x`
-- BF16 vector forward: `1.6x`
+**NVIDIA GPU (GB10 / H100-class, PyTorch 2.10.0+cu130, CUDA 13.0, batch size 4):**
 
-## Core techniques
+| Workload | 256×512 | 512×1024 |
+|---|---:|---:|
+| Scalar forward | **3.2x** | **2.9x** |
+| Scalar inverse | ~1.8x | ~2.0x |
+| Vector forward | **10.2x** | **11.4x** |
+| Vector inverse | ~8.7x | **8.7x** |
+| Scalar forward + backward | **2.3x** | ~2.0x |
+| Vector forward + backward | **4.3x** | ~3.8x |
+| BF16 scalar forward | **4.7x** | **3.0x** |
+| BF16 vector forward | **10.2x** | **11.3x** |
 
-1. Architecture-aware launch selection between `tile_l=4` and `tile_l=8`.
-2. Shared-memory large-grid kernels for scalar, vector, and BF16 real paths.
-3. Dedicated vector forward and inverse kernels to remove the old Python-side
-   packing hot path.
-4. Real-valued BF16 Legendre reductions with float accumulation.
-5. Explicit autograd wrappers for scalar and vector CUDA paths.
-6. CUDA-side `irfft` preparation to avoid extra Python tensor passes.
-7. Local torch JIT build caching under `build/torch_extensions` for safer
-   day-to-day iteration on GB10.
+**Apple Metal/MPS (M4 Mini, PyTorch 2.11.0, batch size 4):**
+- Vector forward: **1.5x–3.25x** (wins on larger grids)
+- Vector inverse: **1.4x–2.81x**
+- Scalar forward: wins on smaller grids; slower on large
+- Sparse `Y_n^m` synthesis: **1.1x**
+- Vector forward+backward: **1.7x**
 
-## Resource snapshot
+## Technical innovation
 
-From `cuobjdump --dump-resource-usage` on the local `sm_120` build:
+1. **Runtime backend selection**: TMA (Tensor Memory Accelerator) for Hopper/Blackwell, with tensor-core variants and FMA kernels available; autotuned on first use via configurable cache
+2. **Dedicated vector kernels**: Specialized forward/inverse kernels eliminate Python-side tensor packing overhead
+3. **Shared-memory design**: Large-grid FP32, BF16, and vector kernels using optimized shared-memory layouts for occupancy
+4. **BF16 real reductions**: Mixed-precision forward path with float accumulation for precision
+5. **CUDA-side irfft prep**: Inverse-FFT preparation offloaded to CUDA to avoid extra Python tensor passes
+6. **Metal hybrid dispatch**: Kernel selection tuned per grid size for Apple Silicon
+7. **Architecture detection**: Runtime SM detection (sm_80, sm_90a, sm_100, etc.) with strategy dispatch
 
-- Scalar forward large kernel: `38` registers/thread, `3136` B shared/block,
-  `256` threads/block, `6` active blocks/SM.
-- Vector forward large kernel: `37` registers/thread, `5248` B shared/block,
-  `256` threads/block, `6` active blocks/SM.
-- BF16 forward large kernel: `34` registers/thread, `2080` B shared/block,
-  `256` threads/block, `6` active blocks/SM.
-- `prepare_irfft`: `19` registers/thread, no shared memory.
+## Configuration and profiling
 
-## Practical constraints
+**Environment variables for tuning:**
+- `HOLYSHT_FORCE_BACKEND={fma,tma,tc_tf32,tc_bf16}` — lock backend selection
+- `HOLYSHT_FORCE_VECTOR_STRATEGY={native_vector,stacked_real}` — override vector forward strategy
+- `HOLYSHT_AUTOTUNE={0|1}` — enable/disable backend autotuning cache
+- `HOLYSHT_USE_TMA={0|1}` — force TMA on/off for A/B testing
+- `HOLYSHT_TMA_BATCH_TILE={1|2}` — forward batch tile size
+- `HOLYSHT_MPS_SCALAR_NATIVE_MAX_NLAT` — Metal scalar kernel cutoff (default 64)
+- `HOLYSHT_MPS_VECTOR_INVERSE_NATIVE_MAX_NLAT` — Metal vector-inverse cutoff (default 512)
+- `HOLYSHT_ENABLE_NVTX=1` — enable NVTX profiling ranges
 
-- HOLYSHT still depends on `torch-harmonics` for quadrature weight generation.
-- The default local build targets `12.0+PTX` on GB10-class systems.
-- `ncu` may require elevated GPU counter permissions; the supplied script falls
-  back to `cuobjdump` resource reporting when those counters are unavailable.
-- Very large inverse-heavy cases should still be run under an allocation cap on
-  unified-memory systems.
+**Profiling scripts:**
+- `scripts/profile_nsys.sh` — Nsight Systems profiling
+- `scripts/profile_ncu.sh` — Nsight Compute profiling (falls back to resource reporting on restricted GPU counter access)
+- `scripts/report_resources.py` — cuobjdump register/shared-memory analysis
+
+## Practical constraints and design
+
+- HOLYSHT still depends on `torch-harmonics` for quadrature weight generation
+- Public Hugging Face distribution is forward-only; inverse and training paths remain in main source for development and regression coverage
+- Default CUDA build targets `12.0+PTX` on GB10; Metal targets arm64 Macs
+- Very large inverse-heavy workloads on unified-memory systems benefit from allocation caps
+- Odd `mmax` shapes are padded to tile-aligned temporary spectral slabs before Legendre stage for TMA/BF16/large scalar paths when beneficial
 
 ## Intended audience
 
-- Researchers already using `torch-harmonics` who want faster SHT execution.
-- Neural operator workloads where SHT dominates forward or training cost.
-- CUDA developers who want a small, inspectable codebase with real profiling and
-  resource-report hooks rather than hand-wavy speed claims.
+- Researchers using `torch-harmonics` who want faster SHT execution
+- Neural operator workloads where SHT dominates forward or training cost
+- CUDA/GPU developers seeking a small, inspectable codebase with real profiling hooks, detailed resource reporting, and documented kernel design
