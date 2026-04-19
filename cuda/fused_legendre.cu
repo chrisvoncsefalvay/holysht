@@ -9,6 +9,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <mma.h>
+#include <cuda_bf16.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -673,7 +674,7 @@ __global__ void fused_legendre_forward_real_tf32_kernel(
             if (l < lmax && k < nlat) {
                 value = static_cast<float>(weight_t[(int)l * nlat * mmax + (int)k * mmax + m]);
             }
-            a_tile[idx] = __float_to_tf32(value);
+            a_tile[idx] = wmma::__float_to_tf32(value);
         }
         #pragma unroll
         for (int idx = lane; idx < 8 * 16; idx += 32) {
@@ -685,7 +686,7 @@ __global__ void fused_legendre_forward_real_tf32_kernel(
             if (b < batch_size && k < nlat) {
                 value = static_cast<float>(input[(int)b * nlat * mmax + (int)k * mmax + m]);
             }
-            b_tile[col * 8 + kk] = __float_to_tf32(value);
+            b_tile[col * 8 + kk] = wmma::__float_to_tf32(value);
         }
 
         __syncthreads();
@@ -998,6 +999,308 @@ __global__ void fused_vector_legendre_forward_large_kernel(
         output[sph_idx] = make_float2(sph_re, sph_im);
         output[tor_idx] = make_float2(tor_re, tor_im);
     }
+}
+
+__launch_bounds__(32, 1)
+__global__ void fused_vector_legendre_forward_tf32_kernel(
+    const float2* __restrict__ input,
+    const float* __restrict__ weight0_t,
+    const float* __restrict__ weight1_t,
+    float2* __restrict__ output,
+    const int batch_size,
+    const int nlat,
+    const int lmax,
+    const int mmax
+) {
+    namespace wmma = nvcuda::wmma;
+
+    const int lane = threadIdx.x;
+    const int m = blockIdx.x;
+    const int l0 = blockIdx.y * 16;
+    const int b0 = blockIdx.z * 16;
+
+    if (m >= mmax || lane >= 32) {
+        return;
+    }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ alignas(16) float a0_tile[16 * 8];
+    __shared__ alignas(16) float a1_tile[16 * 8];
+    __shared__ alignas(16) float b0_re_tile[8 * 16];
+    __shared__ alignas(16) float b0_im_tile[8 * 16];
+    __shared__ alignas(16) float b1_re_tile[8 * 16];
+    __shared__ alignas(16) float b1_im_tile[8 * 16];
+    __shared__ alignas(16) float c00_tile[16 * 16];
+    __shared__ alignas(16) float c01_tile[16 * 16];
+    __shared__ alignas(16) float c10_tile[16 * 16];
+    __shared__ alignas(16) float c11_tile[16 * 16];
+    __shared__ alignas(16) float d00_tile[16 * 16];
+    __shared__ alignas(16) float d01_tile[16 * 16];
+    __shared__ alignas(16) float d10_tile[16 * 16];
+    __shared__ alignas(16) float d11_tile[16 * 16];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a0_frag;
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a1_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> b0_re_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> b0_im_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> b1_re_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> b1_im_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> c00_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> c01_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> c10_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> c11_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> d00_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> d01_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> d10_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> d11_frag;
+    wmma::fill_fragment(c00_frag, 0.0f);
+    wmma::fill_fragment(c01_frag, 0.0f);
+    wmma::fill_fragment(c10_frag, 0.0f);
+    wmma::fill_fragment(c11_frag, 0.0f);
+    wmma::fill_fragment(d00_frag, 0.0f);
+    wmma::fill_fragment(d01_frag, 0.0f);
+    wmma::fill_fragment(d10_frag, 0.0f);
+    wmma::fill_fragment(d11_frag, 0.0f);
+
+    for (int k0 = 0; k0 < nlat; k0 += 8) {
+        #pragma unroll
+        for (int idx = lane; idx < 16 * 8; idx += 32) {
+            const int row = idx / 8;
+            const int kk = idx % 8;
+            const int l = l0 + row;
+            const int k = k0 + kk;
+            float w0 = 0.0f;
+            float w1 = 0.0f;
+            if (l < lmax && k < nlat) {
+                const int weight_idx = (int)l * nlat * mmax + (int)k * mmax + m;
+                w0 = weight0_t[weight_idx];
+                w1 = weight1_t[weight_idx];
+            }
+            a0_tile[idx] = wmma::__float_to_tf32(w0);
+            a1_tile[idx] = wmma::__float_to_tf32(w1);
+        }
+        #pragma unroll
+        for (int idx = lane; idx < 8 * 16; idx += 32) {
+            const int kk = idx % 8;
+            const int col = idx / 8;
+            const int k = k0 + kk;
+            const int b = b0 + col;
+            float2 comp0 = make_float2(0.0f, 0.0f);
+            float2 comp1 = make_float2(0.0f, 0.0f);
+            if (b < batch_size && k < nlat) {
+                const int in_base = (int)b * 2 * nlat * mmax;
+                comp0 = input[in_base + (int)k * mmax + m];
+                comp1 = input[in_base + (int)nlat * mmax + (int)k * mmax + m];
+            }
+            b0_re_tile[col * 8 + kk] = wmma::__float_to_tf32(comp0.x);
+            b0_im_tile[col * 8 + kk] = wmma::__float_to_tf32(comp0.y);
+            b1_re_tile[col * 8 + kk] = wmma::__float_to_tf32(comp1.x);
+            b1_im_tile[col * 8 + kk] = wmma::__float_to_tf32(comp1.y);
+        }
+
+        __syncthreads();
+        wmma::load_matrix_sync(a0_frag, a0_tile, 8);
+        wmma::load_matrix_sync(a1_frag, a1_tile, 8);
+        wmma::load_matrix_sync(b0_re_frag, b0_re_tile, 8);
+        wmma::load_matrix_sync(b0_im_frag, b0_im_tile, 8);
+        wmma::load_matrix_sync(b1_re_frag, b1_re_tile, 8);
+        wmma::load_matrix_sync(b1_im_frag, b1_im_tile, 8);
+        wmma::mma_sync(c00_frag, a0_frag, b0_re_frag, c00_frag);
+        wmma::mma_sync(c01_frag, a0_frag, b0_im_frag, c01_frag);
+        wmma::mma_sync(c10_frag, a0_frag, b1_re_frag, c10_frag);
+        wmma::mma_sync(c11_frag, a0_frag, b1_im_frag, c11_frag);
+        wmma::mma_sync(d00_frag, a1_frag, b0_re_frag, d00_frag);
+        wmma::mma_sync(d01_frag, a1_frag, b0_im_frag, d01_frag);
+        wmma::mma_sync(d10_frag, a1_frag, b1_re_frag, d10_frag);
+        wmma::mma_sync(d11_frag, a1_frag, b1_im_frag, d11_frag);
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(c00_tile, c00_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(c01_tile, c01_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(c10_tile, c10_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(c11_tile, c11_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(d00_tile, d00_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(d01_tile, d01_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(d10_tile, d10_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(d11_tile, d11_frag, 16, wmma::mem_row_major);
+    __syncthreads();
+
+    for (int row = lane; row < 16; row += 32) {
+        const int l = l0 + row;
+        if (l < lmax && m <= l) {
+            #pragma unroll
+            for (int col = 0; col < 16; ++col) {
+                const int b = b0 + col;
+                if (b < batch_size) {
+                    const int tile_idx = row * 16 + col;
+                    const int out_base = (int)b * 2 * lmax * mmax;
+                    const int sph_idx = out_base + (int)l * mmax + m;
+                    const int tor_idx = out_base + (int)lmax * mmax + (int)l * mmax + m;
+                    output[sph_idx] = make_float2(
+                        c00_tile[tile_idx] - d11_tile[tile_idx],
+                        c01_tile[tile_idx] + d10_tile[tile_idx]
+                    );
+                    output[tor_idx] = make_float2(
+                        -d01_tile[tile_idx] - c10_tile[tile_idx],
+                        d00_tile[tile_idx] - c11_tile[tile_idx]
+                    );
+                }
+            }
+        }
+    }
+#endif
+}
+
+__launch_bounds__(32, 1)
+__global__ void fused_vector_legendre_forward_bf16_kernel(
+    const float2* __restrict__ input,
+    const float* __restrict__ weight0_t,
+    const float* __restrict__ weight1_t,
+    float2* __restrict__ output,
+    const int batch_size,
+    const int nlat,
+    const int lmax,
+    const int mmax
+) {
+    namespace wmma = nvcuda::wmma;
+
+    const int lane = threadIdx.x;
+    const int m = blockIdx.x;
+    const int l0 = blockIdx.y * 16;
+    const int b0 = blockIdx.z * 16;
+
+    if (m >= mmax || lane >= 32) {
+        return;
+    }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ alignas(16) __nv_bfloat16 a0_tile[16 * 16];
+    __shared__ alignas(16) __nv_bfloat16 a1_tile[16 * 16];
+    __shared__ alignas(16) __nv_bfloat16 b0_re_tile[16 * 16];
+    __shared__ alignas(16) __nv_bfloat16 b0_im_tile[16 * 16];
+    __shared__ alignas(16) __nv_bfloat16 b1_re_tile[16 * 16];
+    __shared__ alignas(16) __nv_bfloat16 b1_im_tile[16 * 16];
+    __shared__ alignas(16) float c00_tile[16 * 16];
+    __shared__ alignas(16) float c01_tile[16 * 16];
+    __shared__ alignas(16) float c10_tile[16 * 16];
+    __shared__ alignas(16) float c11_tile[16 * 16];
+    __shared__ alignas(16) float d00_tile[16 * 16];
+    __shared__ alignas(16) float d01_tile[16 * 16];
+    __shared__ alignas(16) float d10_tile[16 * 16];
+    __shared__ alignas(16) float d11_tile[16 * 16];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a0_frag;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a1_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b0_re_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b0_im_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b1_re_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b1_im_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c00_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c01_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c10_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c11_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> d00_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> d01_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> d10_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> d11_frag;
+    wmma::fill_fragment(c00_frag, 0.0f);
+    wmma::fill_fragment(c01_frag, 0.0f);
+    wmma::fill_fragment(c10_frag, 0.0f);
+    wmma::fill_fragment(c11_frag, 0.0f);
+    wmma::fill_fragment(d00_frag, 0.0f);
+    wmma::fill_fragment(d01_frag, 0.0f);
+    wmma::fill_fragment(d10_frag, 0.0f);
+    wmma::fill_fragment(d11_frag, 0.0f);
+
+    for (int k0 = 0; k0 < nlat; k0 += 16) {
+        #pragma unroll
+        for (int idx = lane; idx < 16 * 16; idx += 32) {
+            const int row = idx / 16;
+            const int kk = idx % 16;
+            const int l = l0 + row;
+            const int k = k0 + kk;
+            float w0 = 0.0f;
+            float w1 = 0.0f;
+            if (l < lmax && k < nlat) {
+                const int weight_idx = (int)l * nlat * mmax + (int)k * mmax + m;
+                w0 = weight0_t[weight_idx];
+                w1 = weight1_t[weight_idx];
+            }
+            a0_tile[idx] = __float2bfloat16(w0);
+            a1_tile[idx] = __float2bfloat16(w1);
+        }
+        #pragma unroll
+        for (int idx = lane; idx < 16 * 16; idx += 32) {
+            const int kk = idx % 16;
+            const int col = idx / 16;
+            const int k = k0 + kk;
+            const int b = b0 + col;
+            float2 comp0 = make_float2(0.0f, 0.0f);
+            float2 comp1 = make_float2(0.0f, 0.0f);
+            if (b < batch_size && k < nlat) {
+                const int in_base = (int)b * 2 * nlat * mmax;
+                comp0 = input[in_base + (int)k * mmax + m];
+                comp1 = input[in_base + (int)nlat * mmax + (int)k * mmax + m];
+            }
+            b0_re_tile[col * 16 + kk] = __float2bfloat16(comp0.x);
+            b0_im_tile[col * 16 + kk] = __float2bfloat16(comp0.y);
+            b1_re_tile[col * 16 + kk] = __float2bfloat16(comp1.x);
+            b1_im_tile[col * 16 + kk] = __float2bfloat16(comp1.y);
+        }
+
+        __syncthreads();
+        wmma::load_matrix_sync(a0_frag, a0_tile, 16);
+        wmma::load_matrix_sync(a1_frag, a1_tile, 16);
+        wmma::load_matrix_sync(b0_re_frag, b0_re_tile, 16);
+        wmma::load_matrix_sync(b0_im_frag, b0_im_tile, 16);
+        wmma::load_matrix_sync(b1_re_frag, b1_re_tile, 16);
+        wmma::load_matrix_sync(b1_im_frag, b1_im_tile, 16);
+        wmma::mma_sync(c00_frag, a0_frag, b0_re_frag, c00_frag);
+        wmma::mma_sync(c01_frag, a0_frag, b0_im_frag, c01_frag);
+        wmma::mma_sync(c10_frag, a0_frag, b1_re_frag, c10_frag);
+        wmma::mma_sync(c11_frag, a0_frag, b1_im_frag, c11_frag);
+        wmma::mma_sync(d00_frag, a1_frag, b0_re_frag, d00_frag);
+        wmma::mma_sync(d01_frag, a1_frag, b0_im_frag, d01_frag);
+        wmma::mma_sync(d10_frag, a1_frag, b1_re_frag, d10_frag);
+        wmma::mma_sync(d11_frag, a1_frag, b1_im_frag, d11_frag);
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(c00_tile, c00_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(c01_tile, c01_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(c10_tile, c10_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(c11_tile, c11_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(d00_tile, d00_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(d01_tile, d01_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(d10_tile, d10_frag, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(d11_tile, d11_frag, 16, wmma::mem_row_major);
+    __syncthreads();
+
+    for (int row = lane; row < 16; row += 32) {
+        const int l = l0 + row;
+        if (l < lmax && m <= l) {
+            #pragma unroll
+            for (int col = 0; col < 16; ++col) {
+                const int b = b0 + col;
+                if (b < batch_size) {
+                    const int tile_idx = row * 16 + col;
+                    const int out_base = (int)b * 2 * lmax * mmax;
+                    const int sph_idx = out_base + (int)l * mmax + m;
+                    const int tor_idx = out_base + (int)lmax * mmax + (int)l * mmax + m;
+                    output[sph_idx] = make_float2(
+                        c00_tile[tile_idx] - d11_tile[tile_idx],
+                        c01_tile[tile_idx] + d10_tile[tile_idx]
+                    );
+                    output[tor_idx] = make_float2(
+                        -d01_tile[tile_idx] - c10_tile[tile_idx],
+                        d00_tile[tile_idx] - c11_tile[tile_idx]
+                    );
+                }
+            }
+        }
+    }
+#endif
 }
 
 template <int TILE_L>
@@ -2606,6 +2909,47 @@ void launch_vector_forward(
     if (packed_tiles == 0) {
         return;
     }
+
+    const auto* props = at::cuda::getCurrentDeviceProperties();
+    const bool want_tf32_tc = (
+        backend_hint == ForwardBackendHint::TcTf32 &&
+        props != nullptr &&
+        props->major >= 9
+    );
+    const bool want_bf16_tc = (
+        backend_hint == ForwardBackendHint::TcBf16 &&
+        props != nullptr &&
+        props->major >= 9
+    );
+    if (want_tf32_tc || want_bf16_tc) {
+        const int m_tiles = mmax;
+        const int l_tiles = (lmax + 15) / 16;
+        const int batch_tiles = (batch_size + 15) / 16;
+        if (m_tiles == 0 || l_tiles == 0 || batch_tiles == 0) {
+            return;
+        }
+        dim3 tc_grid(m_tiles, l_tiles, batch_tiles);
+        dim3 tc_block(32, 1, 1);
+        if (want_tf32_tc) {
+            fused_vector_legendre_forward_tf32_kernel<<<tc_grid, tc_block, 0, stream>>>(
+                reinterpret_cast<const float2*>(input.data_ptr()),
+                weight0_t.data_ptr<float>(),
+                weight1_t.data_ptr<float>(),
+                reinterpret_cast<float2*>(output.data_ptr()),
+                batch_size, nlat, lmax, mmax
+            );
+        } else {
+            fused_vector_legendre_forward_bf16_kernel<<<tc_grid, tc_block, 0, stream>>>(
+                reinterpret_cast<const float2*>(input.data_ptr()),
+                weight0_t.data_ptr<float>(),
+                weight1_t.data_ptr<float>(),
+                reinterpret_cast<float2*>(output.data_ptr()),
+                batch_size, nlat, lmax, mmax
+            );
+        }
+        return;
+    }
+
     dim3 packed_grid(packed_tiles, 1, batch_size);
 
 #if HOLYSHT_HAS_TMA
@@ -2716,6 +3060,149 @@ void launch_vector_inverse(
         reinterpret_cast<float2*>(output.data_ptr()),
         batch_size, nlat, lmax, mmax
     );
+}
+
+__global__ void fused_vector_forward_pack_real_kernel(
+    const float2* __restrict__ input,
+    float* __restrict__ stacked_w0,
+    float* __restrict__ stacked_w1,
+    const int batch_size,
+    const int nlat,
+    const int mmax
+) {
+    const int total = 4 * batch_size * nlat * mmax;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+
+    const int m = idx % mmax;
+    const int n = (idx / mmax) % nlat;
+    const int packed_batch = idx / (nlat * mmax);
+    const int group = packed_batch / batch_size;
+    const int batch = packed_batch % batch_size;
+
+    const int comp0_offset = (((batch * 2) + 0) * nlat + n) * mmax + m;
+    const int comp1_offset = (((batch * 2) + 1) * nlat + n) * mmax + m;
+    const float2 comp0 = input[comp0_offset];
+    const float2 comp1 = input[comp1_offset];
+
+    switch (group) {
+        case 0:
+            stacked_w0[idx] = comp0.x;
+            stacked_w1[idx] = comp1.y;
+            break;
+        case 1:
+            stacked_w0[idx] = comp0.y;
+            stacked_w1[idx] = comp1.x;
+            break;
+        case 2:
+            stacked_w0[idx] = comp1.x;
+            stacked_w1[idx] = comp0.y;
+            break;
+        default:
+            stacked_w0[idx] = comp1.y;
+            stacked_w1[idx] = comp0.x;
+            break;
+    }
+}
+
+__global__ void fused_vector_forward_recompose_real_kernel(
+    float2* __restrict__ output,
+    const float* __restrict__ out_w0,
+    const float* __restrict__ out_w1,
+    const int batch_size,
+    const int lmax,
+    const int mmax
+) {
+    const int total = batch_size * 2 * lmax * mmax;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+
+    const int m = idx % mmax;
+    const int l = (idx / mmax) % lmax;
+    const int component = (idx / (lmax * mmax)) % 2;
+    const int batch = idx / (2 * lmax * mmax);
+
+    const int plane = lmax * mmax;
+    const int base = l * mmax + m;
+    const int r00_offset = ((0 * batch_size + batch) * plane) + base;
+    const int r01_offset = ((1 * batch_size + batch) * plane) + base;
+    const int r10_offset = ((2 * batch_size + batch) * plane) + base;
+    const int r11_offset = ((3 * batch_size + batch) * plane) + base;
+
+    const float r00 = out_w0[r00_offset];
+    const float r01 = out_w0[r01_offset];
+    const float r10 = out_w0[r10_offset];
+    const float r11 = out_w0[r11_offset];
+
+    const float s11 = out_w1[r00_offset];
+    const float s10 = out_w1[r01_offset];
+    const float s01 = out_w1[r10_offset];
+    const float s00 = out_w1[r11_offset];
+
+    float2 value;
+    if (component == 0) {
+        value.x = r00 - s11;
+        value.y = r01 + s10;
+    } else {
+        value.x = -s01 - r10;
+        value.y = s00 - r11;
+    }
+    output[idx] = value;
+}
+
+void check_vector_forward_pack_real_args(
+    const torch::Tensor& stacked_w0,
+    const torch::Tensor& stacked_w1,
+    const torch::Tensor& input
+) {
+    TORCH_CHECK(input.is_cuda() && stacked_w0.is_cuda() && stacked_w1.is_cuda());
+    TORCH_CHECK(input.is_contiguous() && stacked_w0.is_contiguous() && stacked_w1.is_contiguous());
+    TORCH_CHECK(input.scalar_type() == torch::kComplexFloat, "input must be complex64");
+    TORCH_CHECK(stacked_w0.scalar_type() == torch::kFloat32, "stacked_w0 must be float32");
+    TORCH_CHECK(stacked_w1.scalar_type() == torch::kFloat32, "stacked_w1 must be float32");
+    TORCH_CHECK(input.dim() == 4, "input must be rank 4");
+    TORCH_CHECK(input.size(1) == 2, "input component dimension must be 2");
+    TORCH_CHECK(stacked_w0.dim() == 3 && stacked_w1.dim() == 3, "stacked outputs must be rank 3");
+
+    const int batch_size = input.size(0);
+    const int nlat = input.size(2);
+    const int mmax = input.size(3);
+    TORCH_CHECK(stacked_w0.sizes() == stacked_w1.sizes(), "stacked outputs must match");
+    TORCH_CHECK(stacked_w0.size(0) == 4 * batch_size, "stacked batch dimension must be 4 * batch_size");
+    TORCH_CHECK(stacked_w0.size(1) == nlat, "stacked nlat must match input");
+    TORCH_CHECK(stacked_w0.size(2) == mmax, "stacked mmax must match input");
+    check_32bit_indexing(batch_size * 2, nlat, mmax);
+    check_32bit_indexing(stacked_w0.size(0), stacked_w0.size(1), stacked_w0.size(2));
+}
+
+void check_vector_forward_recompose_real_args(
+    const torch::Tensor& output,
+    const torch::Tensor& out_w0,
+    const torch::Tensor& out_w1
+) {
+    TORCH_CHECK(output.is_cuda() && out_w0.is_cuda() && out_w1.is_cuda());
+    TORCH_CHECK(output.is_contiguous() && out_w0.is_contiguous() && out_w1.is_contiguous());
+    TORCH_CHECK(output.scalar_type() == torch::kComplexFloat, "output must be complex64");
+    TORCH_CHECK(out_w0.scalar_type() == torch::kFloat32, "out_w0 must be float32");
+    TORCH_CHECK(out_w1.scalar_type() == torch::kFloat32, "out_w1 must be float32");
+    TORCH_CHECK(output.dim() == 4, "output must be rank 4");
+    TORCH_CHECK(output.size(1) == 2, "output component dimension must be 2");
+    TORCH_CHECK(out_w0.dim() == 3 && out_w1.dim() == 3, "real outputs must be rank 3");
+    TORCH_CHECK(out_w0.sizes() == out_w1.sizes(), "real outputs must match");
+    TORCH_CHECK(out_w0.size(0) % 4 == 0, "real output batch dimension must be divisible by 4");
+
+    const int batch_size = output.size(0);
+    const int lmax = output.size(2);
+    const int mmax = output.size(3);
+    TORCH_CHECK(out_w0.size(0) == 4 * batch_size, "real output batch dimension must be 4 * output batch_size");
+    TORCH_CHECK(out_w0.size(1) == lmax, "real output lmax must match output");
+    TORCH_CHECK(out_w0.size(2) == mmax, "real output mmax must match output");
+    check_32bit_indexing(batch_size * 2, lmax, mmax);
+    check_32bit_indexing(out_w0.size(0), out_w0.size(1), out_w0.size(2));
 }
 
 void check_complex_legendre_args(
@@ -3008,5 +3495,51 @@ void fused_vector_legendre_inverse(
     } else {
         launch_vector_inverse<4>(output, input, weight0_t, weight1_t, config, stream);
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fused_vector_forward_pack_real(
+    torch::Tensor& stacked_w0,
+    torch::Tensor& stacked_w1,
+    const torch::Tensor& input
+) {
+    check_vector_forward_pack_real_args(stacked_w0, stacked_w1, input);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int total = stacked_w0.numel();
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    fused_vector_forward_pack_real_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const float2*>(input.data_ptr()),
+        stacked_w0.data_ptr<float>(),
+        stacked_w1.data_ptr<float>(),
+        input.size(0),
+        input.size(2),
+        input.size(3)
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fused_vector_forward_recompose_real(
+    torch::Tensor& output,
+    const torch::Tensor& out_w0,
+    const torch::Tensor& out_w1
+) {
+    check_vector_forward_recompose_real_args(output, out_w0, out_w1);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
+    const auto stream = at::cuda::getCurrentCUDAStream();
+
+    const int total = output.numel();
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    fused_vector_forward_recompose_real_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<float2*>(output.data_ptr()),
+        out_w0.data_ptr<float>(),
+        out_w1.data_ptr<float>(),
+        output.size(0),
+        output.size(2),
+        output.size(3)
+    );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

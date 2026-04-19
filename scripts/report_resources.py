@@ -33,9 +33,12 @@ class KernelResource:
     regs: int
     shared: int
     tile_l: int | None
+    explicit_block_threads: int | None = None
 
     @property
     def block_threads(self) -> int | None:
+        if self.explicit_block_threads is not None:
+            return self.explicit_block_threads
         return None if self.tile_l is None else 32 * self.tile_l
 
 
@@ -54,6 +57,15 @@ def parse_resources(binary: Path) -> list[KernelResource]:
                 regs=int(match.group("reg")),
                 shared=int(match.group("shared")),
                 tile_l=int(tile_match.group("tile")) if tile_match else None,
+                explicit_block_threads=(
+                    32
+                    if (
+                        "fused_legendre_forward_real_tf32_kernel" in name
+                        or "fused_vector_legendre_forward_tf32_kernel" in name
+                        or "fused_vector_legendre_forward_bf16_kernel" in name
+                    )
+                    else None
+                ),
             )
         )
     return kernels
@@ -94,6 +106,10 @@ def short_name(name: str) -> str:
         return "vector forward large tma"
     if "fused_vector_legendre_forward_large_kernel" in name:
         return "vector forward large"
+    if "fused_vector_legendre_forward_tf32_kernel" in name:
+        return "vector forward tf32 wmma"
+    if "fused_vector_legendre_forward_bf16_kernel" in name:
+        return "vector forward bf16 wmma"
     if "fused_vector_legendre_inverse_large_tma_kernel" in name:
         return "vector inverse large tma"
     if "fused_vector_legendre_inverse_large_kernel" in name:
@@ -160,6 +176,8 @@ def main() -> None:
                 "fused_vector_legendre_forward_large_tma_kernelILi8EE",
                 "fused_vector_legendre_forward_large_tma_batch2_kernelILi8EE",
                 "fused_vector_legendre_forward_large_kernelILi8EE",
+                "fused_vector_legendre_forward_tf32_kernel",
+                "fused_vector_legendre_forward_bf16_kernel",
                 "fused_vector_legendre_inverse_large_tma_kernelILi8EE",
                 "fused_vector_legendre_inverse_large_kernelILi8EE",
                 "fused_legendre_forward_real_large_tma_kernelIN3c108BFloat16ELi8EE",

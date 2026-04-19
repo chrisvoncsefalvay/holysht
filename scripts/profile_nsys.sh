@@ -9,6 +9,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${ROOT_DIR}/data/profiles"
+SCENARIOS="${HOLYSHT_PROFILE_SCENARIOS:-scalar-forward}"
+GRIDS="${HOLYSHT_PROFILE_GRIDS:-512x1024}"
+BATCH_SIZES="${HOLYSHT_PROFILE_BATCH_SIZES:-4}"
+WARMUP="${HOLYSHT_PROFILE_WARMUP:-10}"
+ITERS="${HOLYSHT_PROFILE_ITERS:-20}"
+MAX_ALLOC_GIB="${HOLYSHT_PROFILE_MAX_ALLOC_GIB:-6}"
+OUTPUT_STEM="${HOLYSHT_PROFILE_OUTPUT_STEM:-holysht_${SCENARIOS//,/__}_nsys}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -21,12 +28,12 @@ nsys profile \
   --trace=cuda,nvtx \
   --sample=none \
   --force-overwrite true \
-  -o "${OUT_DIR}/holysht_scalar_forward_nsys" \
+  -o "${OUT_DIR}/${OUTPUT_STEM}" \
   python3 "${ROOT_DIR}/benchmarks/bench_torch_harmonics.py" \
-    --quick \
-    --scenarios scalar-forward \
-    --grids 512x1024 \
-    --batch-sizes 4 \
-    --warmup 10 \
-    --iters 20 \
-    --max-alloc-gib 6
+    --device cuda \
+    --scenarios "${SCENARIOS}" \
+    --grids "${GRIDS}" \
+    --batch-sizes "${BATCH_SIZES}" \
+    --warmup "${WARMUP}" \
+    --iters "${ITERS}" \
+    --max-alloc-gib "${MAX_ALLOC_GIB}"

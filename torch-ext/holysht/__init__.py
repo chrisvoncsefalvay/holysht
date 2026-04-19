@@ -263,6 +263,22 @@ def _forced_cuda_forward_backend() -> _ForwardBackend:
     return mapping.get(raw, _ForwardBackend.AUTO)
 
 
+def _forced_vector_forward_strategy() -> str:
+    raw = os.environ.get("HOLYSHT_FORCE_VECTOR_STRATEGY", "").strip().lower()
+    mapping = {
+        "": "auto",
+        "auto": "auto",
+        "native": "native_vector",
+        "native_vector": "native_vector",
+        "native-vector": "native_vector",
+        "stacked": "stacked_real",
+        "stacked_real": "stacked_real",
+        "stacked-real": "stacked_real",
+        "composed": "stacked_real",
+    }
+    return mapping.get(raw, "auto")
+
+
 def _autotune_enabled() -> bool:
     raw = os.environ.get("HOLYSHT_AUTOTUNE", "").strip().lower()
     if raw in {"0", "false", "no", "off"}:
@@ -272,6 +288,15 @@ def _autotune_enabled() -> bool:
 
 def _deterministic_forward_backend(candidates: list[str]) -> str:
     for preferred in ("tma", "fma"):
+        if preferred in candidates:
+            return preferred
+    if not candidates:
+        raise ValueError("candidates must not be empty")
+    return candidates[0]
+
+
+def _deterministic_vector_forward_strategy(candidates: list[str]) -> str:
+    for preferred in ("stacked_real", "native_vector"):
         if preferred in candidates:
             return preferred
     if not candidates:
@@ -297,6 +322,32 @@ def _select_forward_backend_for_key(
 
     if not _autotune_enabled():
         return _deterministic_forward_backend(candidates)
+
+    cache = cache or _AutotuneCache(
+        Path(os.environ.get("HOLYSHT_AUTOTUNE_CACHE_PATH", _default_autotune_cache_path()))
+    )
+    if os.environ.get("HOLYSHT_AUTOTUNE_REBENCH", "0") != "1":
+        cached = cache.load(key)
+        if cached in candidates:
+            return cached
+
+    winner = min(candidates, key=benchmark)
+    cache.store(key, winner)
+    return winner
+
+
+def _select_vector_forward_strategy_for_key(
+    key: _AutotuneKey,
+    candidates: list[str],
+    benchmark,
+    cache: Optional[_AutotuneCache] = None,
+) -> str:
+    forced = _forced_vector_forward_strategy()
+    if forced in candidates:
+        return forced
+
+    if not _autotune_enabled():
+        return _deterministic_vector_forward_strategy(candidates)
 
     cache = cache or _AutotuneCache(
         Path(os.environ.get("HOLYSHT_AUTOTUNE_CACHE_PATH", _default_autotune_cache_path()))
@@ -348,6 +399,84 @@ def _benchmark_real_forward_backend(
     return time.perf_counter() - start
 
 
+def _benchmark_device_callable(
+    device: torch.device,
+    run,
+) -> float:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+    with torch.no_grad():
+        run()
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        run()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+    return time.perf_counter() - start
+
+
+def _stack_vector_forward_real_inputs(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, _, nlat, mmax = input.shape
+    input_c = input.contiguous()
+    if input_c.is_cuda and hasattr(_ops, "fused_vector_forward_pack_real"):
+        stacked_w0 = torch.empty((4 * batch_size, nlat, mmax), device=input.device, dtype=torch.float32)
+        stacked_w1 = torch.empty_like(stacked_w0)
+        _ops.fused_vector_forward_pack_real(stacked_w0, stacked_w1, input_c)
+        return stacked_w0, stacked_w1
+
+    xr = torch.view_as_real(input_c)
+    x00_flat = xr[:, 0, :, :, 0].reshape(-1, nlat, mmax)
+    x01_flat = xr[:, 0, :, :, 1].reshape(-1, nlat, mmax)
+    x10_flat = xr[:, 1, :, :, 0].reshape(-1, nlat, mmax)
+    x11_flat = xr[:, 1, :, :, 1].reshape(-1, nlat, mmax)
+    stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).contiguous()
+    stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).contiguous()
+    return stacked_w0, stacked_w1
+
+
+def _recompose_vector_forward_real_outputs(
+    out_w0: torch.Tensor,
+    out_w1: torch.Tensor,
+    *,
+    batch_size: int,
+    lmax: int,
+    mmax: int,
+) -> torch.Tensor:
+    out_w0_c = out_w0.contiguous()
+    out_w1_c = out_w1.contiguous()
+    if out_w0_c.is_cuda and hasattr(_ops, "fused_vector_forward_recompose_real"):
+        output = torch.empty((batch_size, 2, lmax, mmax), device=out_w0.device, dtype=torch.complex64)
+        _ops.fused_vector_forward_recompose_real(output, out_w0_c, out_w1_c)
+        return output
+
+    r00 = out_w0_c[:batch_size]
+    r01 = out_w0_c[batch_size:2 * batch_size]
+    r10 = out_w0_c[2 * batch_size:3 * batch_size]
+    r11 = out_w0_c[3 * batch_size:]
+    s11 = out_w1_c[:batch_size]
+    s10 = out_w1_c[batch_size:2 * batch_size]
+    s01 = out_w1_c[2 * batch_size:3 * batch_size]
+    s00 = out_w1_c[3 * batch_size:]
+
+    xout = torch.empty((batch_size, 2, lmax, mmax, 2), dtype=torch.float32, device=out_w0.device)
+    xout[:, 0, :, :, 0] = r00 - s11
+    xout[:, 0, :, :, 1] = r01 + s10
+    xout[:, 1, :, :, 0] = -s01 - r10
+    xout[:, 1, :, :, 1] = s00 - r11
+    return torch.view_as_complex(xout)
+
+
 def _autotuned_direct_legendre_forward_real(
     input: torch.Tensor,
     weight_t: torch.Tensor,
@@ -387,6 +516,222 @@ def _autotuned_direct_legendre_forward_real(
     if backend_name == "tma" and padded_input is not None and padded_weight_t is not None:
         return _direct_legendre_forward_real(padded_input, padded_weight_t, backend_hint=backend_hint)
     return _direct_legendre_forward_real(input, weight_t, backend_hint=backend_hint)
+
+
+def _vector_forward_strategy_candidates(
+    *,
+    can_use_native: bool,
+    forced_backend: _ForwardBackend,
+) -> list[str]:
+    candidates = ["stacked_real"]
+    if can_use_native:
+        candidates.append("native_vector")
+    return candidates
+
+
+def _native_vector_forward_backend_candidates(
+    *,
+    dtype_mode: str,
+    can_use_tensor_core: bool,
+) -> list[str]:
+    if dtype_mode == "bf16":
+        return ["tma", "tc_bf16"] if can_use_tensor_core else ["tma"]
+    return ["fma", "tma", "tc_tf32"] if can_use_tensor_core else ["fma", "tma"]
+
+
+def _autotuned_direct_vector_forward(
+    input: torch.Tensor,
+    weight0_t: torch.Tensor,
+    weight1_t: torch.Tensor,
+    *,
+    dtype_mode: str,
+    op_kind: str,
+    backend_candidates: list[str],
+    padded_input: Optional[torch.Tensor] = None,
+    padded_weight0_t: Optional[torch.Tensor] = None,
+    padded_weight1_t: Optional[torch.Tensor] = None,
+    cache: Optional[_AutotuneCache] = None,
+    device_name: Optional[str] = None,
+    capability: Optional[str] = None,
+) -> torch.Tensor:
+    resolved_device_name, resolved_capability = _cuda_device_metadata(input.device, device_name, capability)
+    key = _AutotuneKey(
+        device_name=resolved_device_name,
+        capability=resolved_capability,
+        op_kind=op_kind,
+        dtype_mode=dtype_mode,
+        nlat=input.size(2),
+        lmax=weight0_t.size(0),
+        mmax=input.size(3),
+        batch_bucket=_autotune_batch_bucket(int(input.size(0))),
+    )
+
+    forced_backend = _forced_cuda_forward_backend()
+    if forced_backend in (_ForwardBackend.TC_TF32, _ForwardBackend.TC_BF16):
+        forced_name = {
+            _ForwardBackend.TC_TF32: "tc_tf32",
+            _ForwardBackend.TC_BF16: "tc_bf16",
+        }[forced_backend]
+        if forced_name not in backend_candidates:
+            raise RuntimeError(
+                f"forced vector backend {forced_name} is unsupported for dtype_mode={dtype_mode}"
+            )
+
+    def benchmark(name: str) -> float:
+        backend_hint = _backend_name_to_forward_hint(name)
+        bench_input = padded_input if name == "tma" and padded_input is not None else input
+        bench_weight0_t = padded_weight0_t if name == "tma" and padded_weight0_t is not None else weight0_t
+        bench_weight1_t = padded_weight1_t if name == "tma" and padded_weight1_t is not None else weight1_t
+        return _benchmark_device_callable(
+            input.device,
+            lambda: _direct_vector_legendre_forward(
+                bench_input,
+                bench_weight0_t,
+                bench_weight1_t,
+                backend_hint=backend_hint,
+            ),
+        )
+
+    backend_name = _select_forward_backend_for_key(key, backend_candidates, benchmark, cache=cache)
+    out_input = padded_input if backend_name == "tma" and padded_input is not None else input
+    out_weight0_t = padded_weight0_t if backend_name == "tma" and padded_weight0_t is not None else weight0_t
+    out_weight1_t = padded_weight1_t if backend_name == "tma" and padded_weight1_t is not None else weight1_t
+    return _direct_vector_legendre_forward(
+        out_input,
+        out_weight0_t,
+        out_weight1_t,
+        backend_hint=_backend_name_to_forward_hint(backend_name),
+    )[..., : input.size(3)]
+
+
+def _run_vector_forward_native_cuda(
+    input: torch.Tensor,
+    weight0_t: torch.Tensor,
+    weight1_t: torch.Tensor,
+    *,
+    dtype_mode: str,
+    op_kind: str,
+    mmax: int,
+    tma_mmax_complex: int,
+    weight0_t_tma_complex: torch.Tensor,
+    weight1_t_tma_complex: torch.Tensor,
+    cache: Optional[_AutotuneCache] = None,
+    device_name: Optional[str] = None,
+    capability: Optional[str] = None,
+) -> torch.Tensor:
+    can_use_tensor_core = (
+        input.is_cuda
+        and hasattr(torch.cuda, "get_device_capability")
+        and torch.cuda.get_device_capability(input.device)[0] >= 9
+        and hasattr(_ops, "fused_vector_legendre_forward_ex")
+    )
+    backend_candidates = _native_vector_forward_backend_candidates(
+        dtype_mode=dtype_mode,
+        can_use_tensor_core=can_use_tensor_core,
+    )
+    return _autotuned_direct_vector_forward(
+        input,
+        weight0_t,
+        weight1_t,
+        dtype_mode=dtype_mode,
+        op_kind=op_kind,
+        backend_candidates=backend_candidates,
+        padded_input=_pad_last_dim(input, tma_mmax_complex) if _cuda_tma_available(input) and tma_mmax_complex != mmax else None,
+        padded_weight0_t=weight0_t_tma_complex if _cuda_tma_available(input) and tma_mmax_complex != mmax else None,
+        padded_weight1_t=weight1_t_tma_complex if _cuda_tma_available(input) and tma_mmax_complex != mmax else None,
+        cache=cache,
+        device_name=device_name,
+        capability=capability,
+    )
+
+
+def _run_vector_forward_stacked_real_cuda(
+    input: torch.Tensor,
+    weight0_t: torch.Tensor,
+    weight1_t: torch.Tensor,
+    *,
+    dtype_mode: str,
+    lmax: int,
+    mmax: int,
+    tma_mmax_real: int,
+    weight0_t_tma_real: torch.Tensor,
+    weight1_t_tma_real: torch.Tensor,
+    cache: Optional[_AutotuneCache] = None,
+    device_name: Optional[str] = None,
+    capability: Optional[str] = None,
+) -> torch.Tensor:
+    batch_size = input.size(0)
+    stacked_w0, stacked_w1 = _stack_vector_forward_real_inputs(input)
+    backend_candidates = ["fma", "tma", "tc_bf16"] if dtype_mode == "bf16" else ["fma", "tma", "tc_tf32"]
+    stacked_w0_work = stacked_w0.bfloat16().contiguous() if dtype_mode == "bf16" else stacked_w0
+    stacked_w1_work = stacked_w1.bfloat16().contiguous() if dtype_mode == "bf16" else stacked_w1
+    tma_pad_w0 = None
+    if _cuda_tma_available(stacked_w0_work) and tma_mmax_real != mmax:
+        tma_pad_w0 = _pad_last_dim(stacked_w0_work, tma_mmax_real)
+    out_w0 = _autotuned_direct_legendre_forward_real(
+        stacked_w0_work,
+        weight0_t,
+        op_kind="vector-real-forward",
+        dtype_mode=dtype_mode,
+        backend_candidates=backend_candidates,
+        padded_input=tma_pad_w0,
+        padded_weight_t=weight0_t_tma_real if tma_pad_w0 is not None else None,
+        cache=cache,
+        device_name=device_name,
+        capability=capability,
+    )[..., :mmax]
+    tma_pad_w1 = None
+    if _cuda_tma_available(stacked_w1_work) and tma_mmax_real != mmax:
+        tma_pad_w1 = _pad_last_dim(stacked_w1_work, tma_mmax_real)
+    out_w1 = _autotuned_direct_legendre_forward_real(
+        stacked_w1_work,
+        weight1_t,
+        op_kind="vector-real-forward",
+        dtype_mode=dtype_mode,
+        backend_candidates=backend_candidates,
+        padded_input=tma_pad_w1,
+        padded_weight_t=weight1_t_tma_real if tma_pad_w1 is not None else None,
+        cache=cache,
+        device_name=device_name,
+        capability=capability,
+    )[..., :mmax]
+    return _recompose_vector_forward_real_outputs(
+        out_w0,
+        out_w1,
+        batch_size=batch_size,
+        lmax=lmax,
+        mmax=mmax,
+    )
+
+
+def _run_vector_forward_stacked_real_fp32(
+    input: torch.Tensor,
+    weight0_t: torch.Tensor,
+    weight1_t: torch.Tensor,
+    *,
+    lmax: int,
+    mmax: int,
+    tma_mmax_real: int,
+    weight0_t_tma_real: torch.Tensor,
+    weight1_t_tma_real: torch.Tensor,
+    cache: Optional[_AutotuneCache] = None,
+    device_name: Optional[str] = None,
+    capability: Optional[str] = None,
+) -> torch.Tensor:
+    return _run_vector_forward_stacked_real_cuda(
+        input,
+        weight0_t,
+        weight1_t,
+        dtype_mode="fp32",
+        lmax=lmax,
+        mmax=mmax,
+        tma_mmax_real=tma_mmax_real,
+        weight0_t_tma_real=weight0_t_tma_real,
+        weight1_t_tma_real=weight1_t_tma_real,
+        cache=cache,
+        device_name=device_name,
+        capability=capability,
+    )
 
 
 def _mps_scalar_fallback_chunk_m(weight: Optional[torch.Tensor], inverse: bool) -> int:
@@ -1164,51 +1509,109 @@ class RealVectorSHT(nn.Module):
             mmax = self.mmax
             x = x[..., :mmax].contiguous()
 
-            if _HAS_NATIVE_EXT and x.is_cuda and not x.requires_grad and not self._use_bf16 and not self._use_fp16:
+            if _HAS_NATIVE_EXT and x.is_cuda and not x.requires_grad and not self._use_fp16:
                 leading_shape = x.shape[:-3]
                 x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
-                x = torch.view_as_real(x_flat)
+                can_use_native = _can_use_cuda_vector(x_flat, self.w0_t, self.w1_t)
+                forced_backend = _forced_cuda_forward_backend()
+                dtype_mode = "bf16" if self._use_bf16 else "fp32"
+                cache = _AutotuneCache(
+                    Path(os.environ.get("HOLYSHT_AUTOTUNE_CACHE_PATH", _default_autotune_cache_path()))
+                )
+                device_name, capability = _cuda_device_metadata(x_flat.device)
+                strategy_candidates = _vector_forward_strategy_candidates(
+                    can_use_native=can_use_native,
+                    forced_backend=forced_backend,
+                )
+                if can_use_native and len(strategy_candidates) > 1:
+                    key = _AutotuneKey(
+                        device_name=device_name,
+                        capability=capability,
+                        op_kind="vector-forward-strategy",
+                        dtype_mode=dtype_mode,
+                        nlat=self.nlat,
+                        lmax=self.lmax,
+                        mmax=mmax,
+                        batch_bucket=_autotune_batch_bucket(int(x_flat.size(0))),
+                    )
 
-                x00 = x[..., 0, :, :, 0]
-                x01 = x[..., 0, :, :, 1]
-                x10 = x[..., 1, :, :, 0]
-                x11 = x[..., 1, :, :, 1]
+                    def benchmark(strategy_name: str) -> float:
+                        if strategy_name == "native_vector":
+                            return _benchmark_device_callable(
+                                x_flat.device,
+                                lambda: _run_vector_forward_native_cuda(
+                                    x_flat,
+                                    self.w0_t,
+                                    self.w1_t,
+                                    dtype_mode=dtype_mode,
+                                    op_kind="vector-native-forward",
+                                    mmax=mmax,
+                                    tma_mmax_complex=self._tma_mmax_complex,
+                                    weight0_t_tma_complex=self.w0_t_tma_complex,
+                                    weight1_t_tma_complex=self.w1_t_tma_complex,
+                                    cache=cache,
+                                    device_name=device_name,
+                                    capability=capability,
+                                ),
+                            )
+                        return _benchmark_device_callable(
+                            x_flat.device,
+                            lambda: _run_vector_forward_stacked_real_cuda(
+                                x_flat,
+                                self.w0_t,
+                                self.w1_t,
+                                dtype_mode=dtype_mode,
+                                lmax=self.lmax,
+                                mmax=mmax,
+                                tma_mmax_real=self._tma_mmax_real,
+                                weight0_t_tma_real=self.w0_t_tma_real,
+                                weight1_t_tma_real=self.w1_t_tma_real,
+                                cache=cache,
+                                device_name=device_name,
+                                capability=capability,
+                            ),
+                        )
 
-                x00_flat = x00.reshape(-1, self.nlat, mmax)
-                x01_flat = x01.reshape(-1, self.nlat, mmax)
-                x10_flat = x10.reshape(-1, self.nlat, mmax)
-                x11_flat = x11.reshape(-1, self.nlat, mmax)
-                B = x00_flat.shape[0]
+                    strategy = _select_vector_forward_strategy_for_key(
+                        key,
+                        strategy_candidates,
+                        benchmark,
+                        cache=cache,
+                    )
+                else:
+                    strategy = strategy_candidates[0]
 
-                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).contiguous()
-                tma_pad_w0 = None
-                if _cuda_tma_available(stacked_w0) and self._tma_mmax_real != mmax:
-                    tma_pad_w0 = _pad_last_dim(stacked_w0, self._tma_mmax_real)
-                out_w0 = _autotuned_direct_legendre_forward_real(
-                    stacked_w0,
-                    self.w0_t,
-                    op_kind="vector-real-forward",
-                    dtype_mode="fp32",
-                    backend_candidates=["fma", "tma", "tc_tf32"],
-                    padded_input=tma_pad_w0,
-                    padded_weight_t=self.w0_t_tma_real if tma_pad_w0 is not None else None,
-                )[..., :mmax]
-                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
-
-                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).contiguous()
-                tma_pad_w1 = None
-                if _cuda_tma_available(stacked_w1) and self._tma_mmax_real != mmax:
-                    tma_pad_w1 = _pad_last_dim(stacked_w1, self._tma_mmax_real)
-                out_w1 = _autotuned_direct_legendre_forward_real(
-                    stacked_w1,
-                    self.w1_t,
-                    op_kind="vector-real-forward",
-                    dtype_mode="fp32",
-                    backend_candidates=["fma", "tma", "tc_tf32"],
-                    padded_input=tma_pad_w1,
-                    padded_weight_t=self.w1_t_tma_real if tma_pad_w1 is not None else None,
-                )[..., :mmax]
-                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
+                if strategy == "native_vector":
+                    out = _run_vector_forward_native_cuda(
+                        x_flat,
+                        self.w0_t,
+                        self.w1_t,
+                        dtype_mode=dtype_mode,
+                        op_kind="vector-native-forward",
+                        mmax=mmax,
+                        tma_mmax_complex=self._tma_mmax_complex,
+                        weight0_t_tma_complex=self.w0_t_tma_complex,
+                        weight1_t_tma_complex=self.w1_t_tma_complex,
+                        cache=cache,
+                        device_name=device_name,
+                        capability=capability,
+                    )
+                else:
+                    out = _run_vector_forward_stacked_real_cuda(
+                        x_flat,
+                        self.w0_t,
+                        self.w1_t,
+                        dtype_mode=dtype_mode,
+                        lmax=self.lmax,
+                        mmax=mmax,
+                        tma_mmax_real=self._tma_mmax_real,
+                        weight0_t_tma_real=self.w0_t_tma_real,
+                        weight1_t_tma_real=self.w1_t_tma_real,
+                        cache=cache,
+                        device_name=device_name,
+                        capability=capability,
+                    )
+                return out.reshape(leading_shape + (2, self.lmax, mmax))
             elif (not self._use_bf16 and not self._use_fp16) and (_can_use_cuda_vector(x, self.w0_t, self.w1_t) or _can_use_metal_vector(x, self.w0_t, self.w1_t)):
                 leading_shape = x.shape[:-3]
                 x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
@@ -1227,35 +1630,21 @@ class RealVectorSHT(nn.Module):
                 out = _FusedVectorLegendreForwardFn.apply(x_flat, self.w0_t, self.w1_t)
                 return out.reshape(leading_shape + (2, self.lmax, mmax))
 
-            x = torch.view_as_real(x)  # [..., 2, nlat, mmax, 2]
+            leading_shape = x.shape[:-3]
+            x_flat = x.reshape(-1, 2, self.nlat, mmax).contiguous()
+            B = x_flat.shape[0]
+            stacked_w0, stacked_w1 = _stack_vector_forward_real_inputs(x_flat)
 
-            x00 = x[..., 0, :, :, 0]
-            x01 = x[..., 0, :, :, 1]
-            x10 = x[..., 1, :, :, 0]
-            x11 = x[..., 1, :, :, 1]
-
-            leading_shape = x00.shape[:-2]
-            x00_flat = x00.reshape(-1, self.nlat, mmax)
-            x01_flat = x01.reshape(-1, self.nlat, mmax)
-            x10_flat = x10.reshape(-1, self.nlat, mmax)
-            x11_flat = x11.reshape(-1, self.nlat, mmax)
-            B = x00_flat.shape[0]
-
-            if self._use_fp16 and _HAS_NATIVE_EXT and x00_flat.device.type == "mps" and not x.requires_grad:
-                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).half().contiguous()
-                out_w0 = fused_legendre_forward_real(stacked_w0, self.w0_t)
-                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
-
-                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).half().contiguous()
-                out_w1 = fused_legendre_forward_real(stacked_w1, self.w1_t)
-                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
-            elif self._use_bf16 and _HAS_NATIVE_EXT and x00_flat.is_cuda and not x.requires_grad:
-                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).bfloat16().contiguous()
+            if self._use_fp16 and _HAS_NATIVE_EXT and x_flat.device.type == "mps" and not x.requires_grad:
+                out_w0 = fused_legendre_forward_real(stacked_w0.half().contiguous(), self.w0_t)
+                out_w1 = fused_legendre_forward_real(stacked_w1.half().contiguous(), self.w1_t)
+            elif self._use_bf16 and _HAS_NATIVE_EXT and x_flat.is_cuda and not x.requires_grad:
+                stacked_w0_bf16 = stacked_w0.bfloat16().contiguous()
                 tma_pad_w0 = None
-                if _cuda_tma_available(stacked_w0) and self._tma_mmax_real != mmax:
-                    tma_pad_w0 = _pad_last_dim(stacked_w0, self._tma_mmax_real)
+                if _cuda_tma_available(stacked_w0_bf16) and self._tma_mmax_real != mmax:
+                    tma_pad_w0 = _pad_last_dim(stacked_w0_bf16, self._tma_mmax_real)
                 out_w0 = _autotuned_direct_legendre_forward_real(
-                    stacked_w0,
+                    stacked_w0_bf16,
                     self.w0_t,
                     op_kind="vector-real-forward",
                     dtype_mode="bf16",
@@ -1263,14 +1652,13 @@ class RealVectorSHT(nn.Module):
                     padded_input=tma_pad_w0,
                     padded_weight_t=self.w0_t_tma_real if tma_pad_w0 is not None else None,
                 )[..., :mmax]
-                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
 
-                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).bfloat16().contiguous()
+                stacked_w1_bf16 = stacked_w1.bfloat16().contiguous()
                 tma_pad_w1 = None
-                if _cuda_tma_available(stacked_w1) and self._tma_mmax_real != mmax:
-                    tma_pad_w1 = _pad_last_dim(stacked_w1, self._tma_mmax_real)
+                if _cuda_tma_available(stacked_w1_bf16) and self._tma_mmax_real != mmax:
+                    tma_pad_w1 = _pad_last_dim(stacked_w1_bf16, self._tma_mmax_real)
                 out_w1 = _autotuned_direct_legendre_forward_real(
-                    stacked_w1,
+                    stacked_w1_bf16,
                     self.w1_t,
                     op_kind="vector-real-forward",
                     dtype_mode="bf16",
@@ -1278,49 +1666,31 @@ class RealVectorSHT(nn.Module):
                     padded_input=tma_pad_w1,
                     padded_weight_t=self.w1_t_tma_real if tma_pad_w1 is not None else None,
                 )[..., :mmax]
-                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
-            elif (not self._use_bf16 and not self._use_fp16) and _can_use_native_real_legendre(x00_flat, self.w0_t):
-                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0).contiguous()
+            elif (not self._use_bf16 and not self._use_fp16) and _can_use_native_real_legendre(stacked_w0, self.w0_t):
                 out_w0 = fused_legendre_forward_real(stacked_w0, self.w0_t)
-                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
-
-                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0).contiguous()
                 out_w1 = fused_legendre_forward_real(stacked_w1, self.w1_t)
-                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
             else:
                 _low_prec = self._use_bf16 or self._use_fp16
-                stacked_w0 = torch.cat([x00_flat, x01_flat, x10_flat, x11_flat], dim=0)
                 if self._use_bf16:
                     stacked_w0 = stacked_w0.bfloat16()
-                elif self._use_fp16:
-                    stacked_w0 = stacked_w0.half()
-                out_w0 = torch.einsum("bkm,mlk->blm", stacked_w0, self.w0)
-                if _low_prec:
-                    out_w0 = out_w0.float()
-                r00, r01, r10, r11 = out_w0[:B], out_w0[B:2 * B], out_w0[2 * B:3 * B], out_w0[3 * B:]
-
-                stacked_w1 = torch.cat([x11_flat, x10_flat, x01_flat, x00_flat], dim=0)
-                if self._use_bf16:
                     stacked_w1 = stacked_w1.bfloat16()
                 elif self._use_fp16:
+                    stacked_w0 = stacked_w0.half()
                     stacked_w1 = stacked_w1.half()
+                out_w0 = torch.einsum("bkm,mlk->blm", stacked_w0, self.w0)
                 out_w1 = torch.einsum("bkm,mlk->blm", stacked_w1, self.w1)
                 if _low_prec:
+                    out_w0 = out_w0.float()
                     out_w1 = out_w1.float()
-                s11, s10, s01, s00 = out_w1[:B], out_w1[B:2 * B], out_w1[2 * B:3 * B], out_w1[3 * B:]
 
-            sph_re = r00 - s11
-            sph_im = r01 + s10
-            tor_re = -s01 - r10
-            tor_im = s00 - r11
-
-            out_shape = list(leading_shape) + [2, self.lmax, mmax, 2]
-            xout = torch.empty(out_shape, dtype=x.dtype, device=x.device)
-            xout[..., 0, :, :, 0] = sph_re.reshape(leading_shape + (self.lmax, mmax))
-            xout[..., 0, :, :, 1] = sph_im.reshape(leading_shape + (self.lmax, mmax))
-            xout[..., 1, :, :, 0] = tor_re.reshape(leading_shape + (self.lmax, mmax))
-            xout[..., 1, :, :, 1] = tor_im.reshape(leading_shape + (self.lmax, mmax))
-            return torch.view_as_complex(xout)
+            out = _recompose_vector_forward_real_outputs(
+                out_w0[..., :mmax],
+                out_w1[..., :mmax],
+                batch_size=B,
+                lmax=self.lmax,
+                mmax=mmax,
+            )
+            return out.reshape(leading_shape + (2, self.lmax, mmax))
 
 
 class InverseRealVectorSHT(nn.Module):

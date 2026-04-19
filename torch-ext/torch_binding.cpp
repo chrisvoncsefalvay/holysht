@@ -17,6 +17,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("fused_vector_legendre_forward(Tensor! output, Tensor input, Tensor weight0_t, Tensor weight1_t) -> ()");
     ops.def("fused_vector_legendre_forward_ex(Tensor! output, Tensor input, Tensor weight0_t, Tensor weight1_t, int backend_hint) -> ()");
     ops.def("fused_vector_legendre_inverse(Tensor! output, Tensor input, Tensor weight0_t, Tensor weight1_t) -> ()");
+    ops.def("fused_vector_forward_pack_real(Tensor! stacked_w0, Tensor! stacked_w1, Tensor input) -> ()");
+    ops.def("fused_vector_forward_recompose_real(Tensor! output, Tensor out_w0, Tensor out_w1) -> ()");
 
     // SHT helpers
     ops.def("sht_prepare_irfft(Tensor! data, int mmax, int nlon) -> ()");
@@ -38,6 +40,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("fused_vector_legendre_forward_ex", torch::kCUDA, &fused_vector_legendre_forward_ex);
     ops.impl("fused_vector_legendre_inverse", torch::kCUDA, &fused_vector_legendre_inverse);
+    ops.impl("fused_vector_forward_pack_real", torch::kCUDA, &fused_vector_forward_pack_real);
+    ops.impl("fused_vector_forward_recompose_real", torch::kCUDA, &fused_vector_forward_recompose_real);
     ops.impl("sht_prepare_irfft", torch::kCUDA, &sht_prepare_irfft);
 #elif defined(METAL_KERNEL)
     ops.impl("fused_legendre_forward", torch::kMPS, &fused_legendre_forward);

@@ -52,5 +52,17 @@ void fused_vector_legendre_inverse(
     const torch::Tensor& weight1_t
 );
 
+void fused_vector_forward_pack_real(
+    torch::Tensor& stacked_w0,
+    torch::Tensor& stacked_w1,
+    const torch::Tensor& input
+);
+
+void fused_vector_forward_recompose_real(
+    torch::Tensor& output,
+    const torch::Tensor& out_w0,
+    const torch::Tensor& out_w1
+);
+
 // SHT helpers
 void sht_prepare_irfft(torch::Tensor& data, const int64_t mmax, const int64_t nlon);

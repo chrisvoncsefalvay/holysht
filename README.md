@@ -51,38 +51,51 @@ Forward benchmarks were rerun on April 18, 2026 on an NVIDIA GB10 with
 PyTorch `2.10.0+cu130`, CUDA `13.0`, batch size `4`, and
 
 ```bash
-PYTHONPATH=torch-ext HOLYSHT_USE_TMA=1 python3 benchmarks/bench_torch_harmonics.py \
+PYTHONPATH=torch-ext python3 benchmarks/bench_torch_harmonics.py \
+  --device cuda \
   --scenarios scalar-forward,vector-forward,bf16-forward \
   --grids 256x512,512x1024 \
   --batch-sizes 4 \
   --warmup 10 \
   --iters 30 \
-  --max-alloc-gib 6
+  --max-alloc-gib 6 \
+  --force-backend auto
 ```
 
-All `8/8` forward checks passed; the mean speedup over `torch-harmonics` was
-**5.8x**.
 
 | Workload | Grid | torch-harmonics | HOLYSHT | Speedup | MaxAbsErr |
 |---|---|---:|---:|---:|---:|
-| `RealSHT.forward` | `256x512` | 2.580 ms | 0.681 ms | 3.8x | `2.24e-08` |
-| `RealSHT.forward` | `512x1024` | 19.420 ms | 3.453 ms | 5.6x | `1.78e-08` |
-| `RealVectorSHT.forward` | `256x512` | 9.961 ms | 0.978 ms | 10.2x | `1.30e-08` |
-| `RealVectorSHT.forward` | `512x1024` | 77.319 ms | 6.858 ms | 11.3x | `6.49e-09` |
-| `RealSHT.forward (BF16)` | `256x512` | 2.530 ms | 0.540 ms | 4.7x | `6.95e-05` |
-| `RealSHT.forward (BF16)` | `512x1024` | 19.342 ms | 6.558 ms | 3.0x | `3.45e-05` |
-| `RealVectorSHT.forward (BF16)` | `256x512` | 9.959 ms | 2.049 ms | 4.9x | `3.38e-05` |
-| `RealVectorSHT.forward (BF16)` | `512x1024` | 77.177 ms | 26.347 ms | 2.9x | `1.16e-05` |
+| `RealSHT.forward` | `256x512` | 2.581 ms | 0.803 ms | 3.2x | `2.05e-08` |
+| `RealSHT.forward` | `512x1024` | 19.402 ms | 6.668 ms | 2.9x | `1.86e-08` |
+| `RealVectorSHT.forward` | `256x512` | 10.102 ms | 0.991 ms | 10.2x | `7.45e-09` |
+| `RealVectorSHT.forward` | `512x1024` | 77.976 ms | 6.855 ms | 11.4x | `4.69e-09` |
+| `RealSHT.forward (BF16)` | `256x512` | 2.582 ms | 0.553 ms | 4.7x | `6.68e-05` |
+| `RealSHT.forward (BF16)` | `512x1024` | 19.466 ms | 6.596 ms | 3.0x | `3.48e-05` |
+| `RealVectorSHT.forward (BF16)` | `256x512` | 9.877 ms | 0.968 ms | 10.2x | `3.73e-09` |
+| `RealVectorSHT.forward (BF16)` | `512x1024` | 77.484 ms | 6.884 ms | 11.3x | `5.63e-09` |
 
-The large Hopper/Blackwell forward path is now a real microkernel rather than
-just "TMA for the input tile": each large forward TMA block can process two
-batch lanes at once, so the weight stream is reused across multiple outputs
-instead of being paid once per batch item. BF16 still goes through the native
-CUDA real Legendre kernels on GB10, but now benefits from the same batch-tiled
-forward microkernel. FP32 forward can also route through the TF32 WMMA kernel
-when the autotuner selects `tc_tf32`. `tc_bf16` is currently an explicit
-compatibility alias that falls back to the legacy real forward path until a
-true BF16 tensor-core kernel lands.
+This is largely due to the real native-vector tensor-core backends under that
+`native_vector` path:
+
+- `tc_tf32` now dispatches to `fused_vector_legendre_forward_tf32_kernel`
+- `tc_bf16` now dispatches to `fused_vector_legendre_forward_bf16_kernel`
+
+On GB10, the second-level backend selector still prefers `tma` for the
+hot public vector cases because both tensor-core variants are slower than the
+native TMA kernel today.
+
+Representative FP32 strategy/backend A/B on `512x1024`, batch `4`:
+
+| Public vector forward case | `native_vector+tma` | `native_vector+tc_tf32` | `stacked_real+tc_tf32` | Auto |
+|---|---:|---:|---:|---:|
+| `RealVectorSHT.forward` | 6.859 ms | 17.606 ms | 23.459 ms | 6.855 ms |
+
+Representative BF16 backend A/B on `512x1024`, batch `4`:
+
+| Public vector forward case | `native_vector+tma` | `native_vector+tc_bf16` | Auto |
+|---|---:|---:|---:|
+| `RealVectorSHT.forward (BF16)` | 7.014 ms | 16.680 ms | 6.884 ms |
+
 
 Odd-`mmax` public forward shapes are still padded into tile-aligned temporary
 spectral slabs before the Legendre stage when that actually helps on GB10.
@@ -90,8 +103,53 @@ TMA itself only needs 16-byte alignment, but the current forward microkernels
 still prefer 8-wide `m` tiles, so the complex public path intentionally keeps
 the wider pad.
 
-The Apple Metal/MPS backend remains in-tree and validated separately on Apple
-Silicon; the table above is the current GB10 forward rerun.
+The non-CUDA benchmark suite was also rerun on April 18, 2026 on this Apple
+Silicon machine with PyTorch `2.11.0`, Apple Metal/MPS, batch size `4`, and
+
+```bash
+PYTHONPATH=torch-ext .venv/bin/python benchmarks/bench_torch_harmonics.py \
+  --quick \
+  --device mps \
+  --scenarios scalar-forward,scalar-inverse,roundtrip,vector-forward,vector-inverse,ynm,scalar-train,vector-train \
+  --max-alloc-gib 6 \
+  --output data/bench_torch_harmonics_mps.json
+```
+
+That Apple-safe run excludes the CUDA-only BF16/tensor-core scenarios. All
+`18/18` MPS checks passed with a mean speedup of **1.4x**. The measured result
+is not "MPS is uniformly faster"; it is more specific than that:
+
+- vector forward and inverse are consistently faster, including the largest
+  tested `512x1024` cases
+- sparse synthesis is slightly faster
+- scalar forward only wins on smaller grids
+- scalar inverse, roundtrip, and scalar training are still slower on the
+  larger tested MPS cases
+
+Representative MPS results from that run:
+
+| Workload | Grid | torch-harmonics | HOLYSHT | Speedup | MaxAbsErr |
+|---|---|---:|---:|---:|---:|
+| `RealSHT.forward` | `512x1024` | 15.000 ms | 20.465 ms | 0.7x | `1.69e-08` |
+| `InverseRealSHT.forward` | `512x1024` | 8.844 ms | 19.963 ms | 0.4x | `1.67e-06` |
+| `Roundtrip(SHT→ISHT)` | `512x1024` | 22.106 ms | 39.421 ms | 0.6x | `1.97e-06` |
+| `RealVectorSHT.forward` | `512x1024` | 55.311 ms | 37.480 ms | 1.5x | `3.52e-09` |
+| `InverseRealVectorSHT.forward` | `512x1024` | 56.159 ms | 39.644 ms | 1.4x | `2.32e-06` |
+| `Y_n^m synthesis (ISHT, sparse)` | `128x256 (lmax=64)` | 0.323 ms | 0.282 ms | 1.1x | `0.00e+00` |
+| `RealSHT.forward+backward` | `256x512` | 5.399 ms | 6.400 ms | 0.8x | `8.88e-16` |
+| `RealVectorSHT.forward+backward` | `256x512` | 21.424 ms | 12.586 ms | 1.7x | `3.24e-12` |
+
+The best Apple wins in this run were the vector paths:
+
+- `RealVectorSHT.forward 64x128`: **3.25x**
+- `InverseRealVectorSHT.forward 64x128`: **2.81x**
+- `RealVectorSHT.forward+backward 256x512`: **1.70x**
+
+The full structured results for this box are in
+`data/bench_torch_harmonics_mps.json`, and `data/bench_torch_harmonics.json`
+was refreshed from the same run so the local benchmark artifact is no longer a
+stale one-case MPS sample.
+
 
 ## Profiling and resources
 
@@ -108,6 +166,8 @@ The project ships a lightweight profiling path that avoids the heavyweight
 - `HOLYSHT_FORCE_BACKEND` can be set to `fma`, `tma`, `tc_tf32`, or
   `tc_bf16`. The benchmark runner and module forwards surface the selected
   backend in logs when this is set.
+- `HOLYSHT_FORCE_VECTOR_STRATEGY` can be set to `native_vector` or
+  `stacked_real` to override the top-level CUDA vector-forward strategy.
 - `HOLYSHT_AUTOTUNE` is enabled by default. When it is unset or truthy, forward
   backend choices are cached in `~/.cache/holysht/holysht_autotune_cache.json`
   by default, or at the path named by `HOLYSHT_AUTOTUNE_CACHE_PATH`.
@@ -115,9 +175,14 @@ The project ships a lightweight profiling path that avoids the heavyweight
   `HOLYSHT_AUTOTUNE=0|false|no|off` to skip cache and benchmark autotuning and
   use a deterministic preference order instead (`tma`, then `fma`, then the
   first available candidate).
-- `scripts/profile_nsys.sh` profiles the scalar forward case with `nsys`.
-- `scripts/profile_ncu.sh` attempts `ncu`; if GPU counters are unavailable for
-  the current user it falls back to `scripts/report_resources.py`.
+- `scripts/profile_nsys.sh` and `scripts/profile_ncu.sh` now honour
+  `HOLYSHT_PROFILE_SCENARIOS`, `HOLYSHT_PROFILE_GRIDS`,
+  `HOLYSHT_PROFILE_BATCH_SIZES`, `HOLYSHT_PROFILE_WARMUP`,
+  `HOLYSHT_PROFILE_ITERS`, `HOLYSHT_PROFILE_MAX_ALLOC_GIB`, and
+  `HOLYSHT_PROFILE_OUTPUT_STEM`, so the Nsight helpers can target scalar,
+  vector, or BF16 cases without editing the scripts.
+- `scripts/profile_ncu.sh` still falls back to `scripts/report_resources.py`
+  when GPU counters are unavailable for the current user.
 
 One caveat from the current branch: public SHT workloads derived from even
 `nlon` usually have `mmax = nlon / 2 + 1`, which is odd. On GB10 that means the
@@ -127,29 +192,29 @@ BF16 forward, and large scalar forward. Small scalar FP32 shapes such as
 `256x512` still stay on the packed non-TMA kernel because the padding overhead
 was slower there.
 
-Representative `nsys` runs on `512x1024`, batch `4`:
+Representative isolated HOLYSHT-only `nsys` runs on `512x1024`, batch `4`:
 
-- `fused_legendre_forward_large_tma_batch2_kernel<8>` averaged **3.20 ms** per
-  launch on `RealSHT.forward(512x1024, batch=4)`.
-- `fused_vector_legendre_forward_large_tma_batch2_kernel<8>` averaged
-  **6.43 ms** per launch on `RealVectorSHT.forward(512x1024, batch=4)`.
+- Vector `native_vector+tma`
+  (`HOLYSHT_FORCE_VECTOR_STRATEGY=native_vector HOLYSHT_FORCE_BACKEND=tma`):
+  the hot kernel is `fused_vector_legendre_forward_large_tma_batch2_kernel<8>`,
+  which takes **92.4%** of GPU kernel time with a **6.34 ms** average launch
+  time across `30` launches.
+- Vector `native_vector+tc_tf32`
+  (`HOLYSHT_FORCE_VECTOR_STRATEGY=native_vector HOLYSHT_FORCE_BACKEND=tc_tf32`):
+  the hot kernel is `fused_vector_legendre_forward_tf32_kernel`, which takes
+  **97.1%** of GPU kernel time with a **17.64 ms** average launch time across
+  `30` launches.
 
-The most useful A/B on GB10 is now `HOLYSHT_TMA_BATCH_TILE=1` vs `2` on the
-public forward workloads. On batch `4`, the batch-tiled microkernel wins by
-reusing weights across two batch lanes:
+That profile is the main reason the second-level backend selector still picks
+`tma` on GB10: once the public path stays in the native vector kernel family,
+the remaining gap is inside the tensor-core kernel itself, not in wrapper
+packing or fallback composition.
 
-| Public forward case | `B_TILE=1` | `B_TILE=2` | Delta |
-|---|---:|---:|---:|
-| `RealSHT.forward 512x1024` | 6.419 ms | 3.453 ms | 1.86x |
-| `RealVectorSHT.forward 512x1024` | 12.983 ms | 6.858 ms | 1.89x |
-| `RealSHT.forward (BF16) 512x1024` | 12.601 ms | 6.558 ms | 1.92x |
-| `RealVectorSHT.forward (BF16) 512x1024` | 50.365 ms | 26.347 ms | 1.91x |
-
-That is a much healthier place to be, but it is not the end of the road. The
-current microkernel still scalar-loads the weight tile inside each thread; it
-just amortises those loads across two batch lanes. The next Hopper/Blackwell
-step is still a denser weight-staging / tensor-core formulation rather than
-more input-side plumbing.
+For comparison, forcing `HOLYSHT_FORCE_VECTOR_STRATEGY=stacked_real` with
+`HOLYSHT_FORCE_BACKEND=tc_tf32` still drops the public
+`RealVectorSHT.forward(512x1024, batch=4)` case to **23.459 ms**. So the new
+native vector TF32 backend is already a real improvement over composed TF32,
+but it is still nowhere near the native TMA winner on this GPU.
 
 Current forward-kernel resource snapshot from
 `PYTHONPATH=torch-ext python3 scripts/report_resources.py` on GB10:
@@ -159,17 +224,24 @@ Current forward-kernel resource snapshot from
 | Scalar forward large | 63 | 5248 B | 256 | 4 | 66.7% |
 | Scalar forward large TMA | 48 | 9224 B | 256 | 5 | 83.3% |
 | Scalar forward large TMA batch2 | 59 | 17424 B | 256 | 4 | 66.7% |
+| Scalar forward TF32 WMMA | 72 | 3072 B | 32 | 28 | 58.3% |
 | Vector forward large | 64 | 9472 B | 256 | 4 | 66.7% |
 | Vector forward large TMA | 48 | 17424 B | 256 | 5 | 83.3% |
 | Vector forward large TMA batch2 | 24 | 33824 B | 256 | 3 | 50.0% |
+| Vector forward TF32 WMMA | 156 | 12288 B | 32 | 8 | 16.7% |
+| Vector forward BF16 WMMA | 206 | 12288 B | 32 | 8 | 16.7% |
 | BF16 forward large | 63 | 3136 B | 256 | 4 | 66.7% |
 | BF16 forward large TMA | 40 | 3080 B | 256 | 6 | 100.0% |
 | BF16 forward large TMA batch2 | 40 | 5136 B | 256 | 6 | 100.0% |
 
-The vector batch2 kernel is the clearest tradeoff: it gives up occupancy to
-buy much higher weight reuse. On GB10 that trade is absolutely worth it, which
-is why the measured runtime still drops from `12.983 ms` to `6.858 ms` on the
-`512x1024`, batch `4` case.
+The updated resource table makes the current trade visible. The scalar TMA
+batch2 kernel still wins public scalar forward despite its larger shared-memory
+footprint, and the new vector WMMA kernels are clearly real kernels now rather
+than API aliases. But on GB10 they come in at **156** and **206** regs/thread
+with only **16.7%** theoretical occupancy, which lines up with the `nsys`
+result that native vector `tma` still wins decisively. On this machine the real
+fix was not "force tensor cores harder" but "keep public vector forward in the
+native kernel family and let autotune reject the slower TC variants."
 
 ## Public API
 
@@ -224,9 +296,9 @@ paths.
 - `HOLYSHT_TMA_BATCH_TILE=1` keeps the original one-batch-per-block TMA
   forward kernels; `=2` enables the batch-tiled forward microkernel and is the
   default on Hopper/Blackwell.
-- `tc_bf16` is accepted as a backend hint for API compatibility, but it still
-  degrades to the legacy real forward path until a real BF16 tensor-core
-  implementation is added.
+- `tc_tf32` and `tc_bf16` now both map to real native forward tensor-core
+  backends on SM90+, but on GB10 the autotuner still prefers `tma` for the
+  hot public vector workloads.
 - `HOLYSHT_USE_FAST_MATH=0` disables `--use_fast_math` for the local JIT build.
 - `build.toml` is pinned to `sm_120` for the kernel-builder path so it no
   longer tries to fan out across a wide architecture matrix on GB10.
@@ -243,8 +315,13 @@ PYTHONPATH=torch-ext python3 benchmarks/bench_torch_harmonics.py --quick --devic
 To profile a single case:
 
 ```bash
-./scripts/profile_nsys.sh
-./scripts/profile_ncu.sh
+HOLYSHT_FORCE_BACKEND=tma HOLYSHT_PROFILE_SCENARIOS=scalar-forward \
+  HOLYSHT_PROFILE_GRIDS=512x1024 HOLYSHT_PROFILE_BATCH_SIZES=4 \
+  ./scripts/profile_nsys.sh
+HOLYSHT_FORCE_VECTOR_STRATEGY=native_vector HOLYSHT_PROFILE_SCENARIOS=vector-forward \
+  HOLYSHT_PROFILE_GRIDS=512x1024 HOLYSHT_PROFILE_BATCH_SIZES=4 \
+  ./scripts/profile_nsys.sh
+HOLYSHT_FORCE_BACKEND=tma ./scripts/profile_ncu.sh
 python3 scripts/report_resources.py
 ```
 
